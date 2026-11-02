@@ -1,0 +1,9 @@
+/build/
+/build-cmake/
+*.obj
+imgui.ini
+GroovyGrab.ini
+NOTES.md
+/dist/
+release.bat
+make_zip.ps1
