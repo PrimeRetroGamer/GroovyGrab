@@ -251,6 +251,20 @@ Sender::clock::time_point Sender::next_frame_deadline(bool early) const {
                      std::chrono::duration<double>(frames_left * frame_seconds()));
 }
 
+Sender::clock::time_point Sender::next_land(double margin_seconds) const {
+    const auto now = clock::now();
+    const double period = frame_seconds();
+    if (!raster_valid_ || period <= 0.0) return now + frame_duration();
+    const double want = release_fraction() - margin_seconds / period;
+    const double pos = raster_at_time(now);
+    double target = std::floor(pos) + want;
+    // Half a millisecond: closer than that and the spin would miss this land.
+    if (pos + 0.0005 / period >= target) target += 1.0;
+    const double frames_left = target - pos;
+    return now + std::chrono::duration_cast<clock::duration>(
+                     std::chrono::duration<double>(frames_left * period));
+}
+
 bool Sender::raster_sample(double& position, clock::time_point& at) const {
     if (!raster_valid_) return false;
     position = raster_position_;

@@ -235,7 +235,8 @@ RateLock::Action RateLock::check_capture_rate(double gap_ms, clock::time_point c
     return Action::None;
 }
 
-RateLock::Action RateLock::after_send(const Sender& sender, clock::time_point captured) {
+RateLock::Action RateLock::after_send(const Sender& sender, clock::time_point arrived,
+                                       clock::time_point source, bool track_phase) {
     if (state == State::Slide) return update_slide(sender);
     if (state != State::Locked) return Action::None;
     const auto now = clock::now();
@@ -243,15 +244,17 @@ RateLock::Action RateLock::after_send(const Sender& sender, clock::time_point ca
 
     double gap_ms = 0.0;
     if (have_arrival) {
-        gap_ms = std::chrono::duration<double, std::milli>(captured - last_arrival).count();
+        gap_ms = std::chrono::duration<double, std::milli>(source - last_arrival).count();
         record_gap(gap_ms);
     }
-    last_arrival = captured;
+    last_arrival = source;
     have_arrival = true;
-    if (const Action change = check_capture_rate(gap_ms, captured); change != Action::None) {
+    if (const Action change = check_capture_rate(gap_ms, source); change != Action::None) {
         return change;
     }
-    return use_trim ? update_trim(sender) : update_clock(sender, captured, now);
+    // The rate was recorded above. A frame sent on the next land does not move the phase.
+    if (!track_phase) return Action::None;
+    return use_trim ? update_trim(sender) : update_clock(sender, arrived, source, now);
 }
 
 void RateLock::record_gap(double gap_ms) {
@@ -262,17 +265,18 @@ void RateLock::record_gap(double gap_ms) {
 }
 
 // Stock core: holds the phase by correcting the clock when it has drifted too far.
-RateLock::Action RateLock::update_clock(const Sender& sender, clock::time_point captured, clock::time_point now) {
+RateLock::Action RateLock::update_clock(const Sender& sender, clock::time_point arrived,
+                                           clock::time_point source, clock::time_point now) {
     const bool warm = now - since >= kWarmup;
     const double frame_ms = sender.field_ms(); // blit period
     if (warm) {
         if (!cap_rate.valid) {
             const double seed_ms = gap_count >= 16 ? median_gap_ms() : frame_ms * plan.repeat;
-            cap_rate.start(captured, 1000.0 / seed_ms);
+            cap_rate.start(source, 1000.0 / seed_ms);
         } else {
-            cap_rate.add(captured);
+            cap_rate.add(source);
         }
-        cap_t1 = captured;
+        cap_t1 = source;
     }
     double position = 0.0;
     clock::time_point at{};
@@ -300,7 +304,7 @@ RateLock::Action RateLock::update_clock(const Sender& sender, clock::time_point 
 
     // Phase of the raster when this sample arrived.
     if (!warm || !new_raster) return Action::None;
-    const double ack_after_ms = std::chrono::duration<double, std::milli>(at - captured).count();
+    const double ack_after_ms = std::chrono::duration<double, std::milli>(at - arrived).count();
     const double phase = wrap(position - ack_after_ms / frame_ms);
     if (!have_target) {
         constexpr double kTau = 6.283185307179586;

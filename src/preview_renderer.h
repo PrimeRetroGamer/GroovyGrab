@@ -13,6 +13,7 @@ struct PreviewRenderer {
     explicit PreviewRenderer(HWND window);
 
     void upload_rgb(const uint8_t* rgb, LONG pitch, UINT width, UINT height);
+    void upload_bgra(const uint8_t* bgra, LONG pitch, UINT width, UINT height);
     void upload_yuy2(const uint8_t* yuy2, LONG pitch, UINT width, UINT height);
     void clear_image() { has_image = false; }
 

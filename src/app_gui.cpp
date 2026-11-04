@@ -146,7 +146,7 @@ void draw_stats_overlay(const Frame& frame) {
     rows.emplace_back("Capture", format_text("%.1f fps", s.fps));
     rows.emplace_back("Gaps", count_text(s.source_gaps));
     rows.emplace_back("Preview Drops", count_text(s.latest_drops));
-    rows.emplace_back("Fields Sent", count_text(s.mister_sent));
+    rows.emplace_back("Duplicates Sent", count_text(s.mister_duplicates));
     rows.emplace_back("Samples Skipped", count_text(s.mister_replaced));
     rows.emplace_back("Send", format_text("%.2f ms", s.mister_ms));
     if (s.decode_ms > 0.0) rows.emplace_back("JPEG Decode", format_text("%.2f ms", s.decode_ms));
@@ -394,7 +394,11 @@ void draw(Frame& frame) {
     error_text(frame.stats.audio_error);
     error_text(frame.stats.settings_error);
     if (frame.stream && !mister_up && !frame.stats.mister_calibrating) error_text(frame.stats.mister_error);
-    if (mister_up) error_text(frame.stats.capture_warning);
+    if (mister_up && !frame.stats.capture_warning.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+        ImGui::TextWrapped("%s", frame.stats.capture_warning.c_str());
+        ImGui::PopStyleColor();
+    }
 
     ImGui::EndChild();
 

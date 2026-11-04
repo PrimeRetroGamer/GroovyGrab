@@ -20,7 +20,7 @@ if not exist build mkdir build
 set IMGUI=third_party\imgui
 set LZ4=third_party\lz4
 set TJ=third_party\libjpeg-turbo\sdk
-set APP_SRC=src\main.cpp src\app.cpp src\app_gui.cpp src\app_window.cpp src\format_menu.cpp src\preview_renderer.cpp src\directshow_capture.cpp src\audio_capture.cpp src\async_sender.cpp src\async_calibrate.cpp src\field_prep.cpp src\field_prep_avx2.cpp src\groovy_sender.cpp src\latency_probe.cpp src\rate_lock.cpp
+set APP_SRC=src\main.cpp src\app.cpp src\app_gui.cpp src\app_window.cpp src\format_menu.cpp src\preview_renderer.cpp src\directshow_capture.cpp src\desktop_capture.cpp src\audio_capture.cpp src\async_sender.cpp src\async_calibrate.cpp src\field_prep.cpp src\field_prep_avx2.cpp src\groovy_sender.cpp src\latency_probe.cpp src\rate_lock.cpp
 set IMGUI_SRC=%IMGUI%\imgui.cpp %IMGUI%\imgui_draw.cpp %IMGUI%\imgui_tables.cpp %IMGUI%\imgui_widgets.cpp %IMGUI%\backends\imgui_impl_win32.cpp %IMGUI%\backends\imgui_impl_dx11.cpp
 rc /nologo /fo build\groovygrab.res src\groovygrab.rc
 if errorlevel 1 exit /b 1

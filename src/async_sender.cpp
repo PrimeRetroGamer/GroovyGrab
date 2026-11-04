@@ -1,6 +1,7 @@
 #include "async_sender.h"
 
 #include <avrt.h>
+#include <windows.h>
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +12,11 @@
 
 namespace groovy {
 
+AsyncSender::~AsyncSender() {
+    close();
+    if (scale_done_) CloseHandle(scale_done_);
+}
+
 namespace {
 
 using clock = std::chrono::steady_clock;
@@ -20,6 +26,11 @@ using clock = std::chrono::steady_clock;
 constexpr auto kSpinBeforeDeadline = std::chrono::microseconds(2500);
 
 constexpr auto kFirstSampleLimit = std::chrono::milliseconds(250);
+
+// How long to leave for a desktop picture before one has been timed. After that,
+// recent scales set the allowance, and one slow scale does not stick.
+constexpr auto kScaleBudgetGuess = std::chrono::milliseconds(8);
+constexpr auto kScaleBudgetMargin = std::chrono::milliseconds(1);
 
 constexpr size_t kMaxQueuedAudioBytes = 48000u * 4u / 25u; // 40 ms of 48 kHz stereo s16
 
@@ -127,9 +138,46 @@ void AsyncSender::set_view(const ViewSettings& view) {
     crop_v_.store(view.crop_v);
 }
 
+std::chrono::steady_clock::time_point AsyncSender::media_time(std::int64_t sample_100ns) {
+    const auto now = clock::now();
+    if (sample_100ns < 0) {
+        media_origin_valid_ = false;
+        return now;
+    }
+    // 100 ms back, or a clock that has not been seen yet: this graph restarted.
+    if (!media_origin_valid_ || sample_100ns + 1000000 < media_origin_) {
+        media_origin_ = sample_100ns;
+        media_steady_ = now;
+        media_origin_valid_ = true;
+    }
+    const auto ticks = std::chrono::nanoseconds((sample_100ns - media_origin_) * 100);
+    return media_steady_ + ticks;
+}
+
+// A picture normally arrives a steady delay after its timestamp. One that
+// arrives much later repeats the previous picture for this refresh and goes
+// out on the next one. The delay stays based on pictures that were on time.
+bool AsyncSender::late_handoff(const PreparedField& field) const {
+    if (!delivery_valid_) return false;
+    const auto extra = (field.captured - field.source) - delivery_offset_;
+    const double limit_ms = RateLock::kTrimLandMarginSeconds * 1000.0;
+    return std::chrono::duration<double, std::milli>(extra).count() > limit_ms;
+}
+
+void AsyncSender::note_handoff(const PreparedField& field) {
+    delivery_offset_ = field.captured - field.source;
+    delivery_valid_ = true;
+}
+
 // Caller holds mutex_ and has filled pending_.
-void AsyncSender::publish_pending(PendingKind kind, unsigned width, unsigned height) {
+void AsyncSender::publish_pending(PendingKind kind, unsigned width, unsigned height,
+                                 std::chrono::steady_clock::time_point source, bool hold,
+                                 std::chrono::steady_clock::time_point started) {
     pending_at_ = clock::now();
+    pending_source_ = source;
+    pending_started_ = started;
+    pending_hold_ = hold;
+    pending_epoch_ = handoff_epoch_;
     pending_w_ = width;
     pending_h_ = height;
     pending_kind_ = kind;
@@ -138,9 +186,95 @@ void AsyncSender::publish_pending(PendingKind kind, unsigned width, unsigned hei
     pending_cv_.notify_one();
 }
 
-void AsyncSender::submit_packed422(const uint8_t* source, long pitch, unsigned width,
-                                   unsigned height, bool uyvy) {
+void AsyncSender::note_desktop_scale(std::chrono::nanoseconds cost) {
+    if (cost <= std::chrono::nanoseconds::zero()) return;
+    scale_ring_[scale_ring_pos_] = cost;
+    scale_ring_pos_ = (scale_ring_pos_ + 1) % static_cast<int>(scale_ring_.size());
+    if (scale_ring_count_ < static_cast<int>(scale_ring_.size())) ++scale_ring_count_;
+    auto worst = scale_ring_[0];
+    for (int i = 1; i < scale_ring_count_; ++i) worst = std::max(worst, scale_ring_[i]);
+    scale_budget_ns_.store((worst + kScaleBudgetMargin).count());
+}
+
+void AsyncSender::finish_held_scale(bool keep, const PreparedField& field, uint64_t epoch) {
+    {
+        std::lock_guard lock(mutex_);
+        if (keep && running_ && epoch == handoff_epoch_) {
+            held_.data[0] = field.data[0];
+            held_.data[1] = field.data[1];
+            held_.size = field.size;
+            held_.ready[0].store(field.ready[0].load());
+            held_.ready[1].store(field.ready[1].load());
+            held_.decode_ms = field.decode_ms;
+            held_.convert_ms = field.convert_ms;
+            held_.lz4_ms = field.lz4_ms;
+            held_ready_ = true;
+        }
+    }
+    scale_busy_.store(false);
+    if (scale_done_) SetEvent(scale_done_);
+}
+
+bool AsyncSender::submit_bgra_held(const uint8_t* source, long pitch, unsigned width,
+                                   unsigned height) {
+    if (!connected_.load() || !source || width < 2 || height < 1) return false;
+    const auto started = clock::now();
+    const size_t row = static_cast<size_t>(width) * 4u;
+    incoming_.resize(row * height);
+    for (unsigned y = 0; y < height; ++y) {
+        std::memcpy(incoming_.data() + y * row, source + static_cast<ptrdiff_t>(y) * pitch, row);
+    }
+    scale_busy_.store(true);
+    std::lock_guard lock(mutex_);
+    pending_.swap(incoming_);
+    publish_pending(PendingKind::Bgra, width, height, started, true, started);
+    return true;
+}
+
+void AsyncSender::note_desktop_tick() {
     capture_rate_.add(clock::now());
+}
+
+bool AsyncSender::release_held_frame() {
+    clock::time_point now;
+    {
+        std::lock_guard lock(mutex_);
+        if (!running_ || !held_ready_) return false;
+        PreparedField& dest = prepared_[prep_ready_];
+        dest.data[0] = held_.data[0];
+        dest.data[1] = held_.data[1];
+        dest.size = held_.size;
+        dest.ready[0].store(held_.ready[0].load());
+        dest.ready[1].store(held_.ready[1].load());
+        dest.decode_ms = held_.decode_ms;
+        dest.convert_ms = held_.convert_ms;
+        dest.lz4_ms = held_.lz4_ms;
+        now = clock::now();
+        dest.captured = now;
+        dest.source = now;
+        dest.picked = now;
+        dest.handoff_epoch = handoff_epoch_;
+        prep_new_ = true;
+    }
+    prepared_cv_.notify_one();
+    return true;
+}
+
+std::chrono::nanoseconds AsyncSender::scale_budget() const {
+    const auto ns = scale_budget_ns_.load();
+    if (ns <= 0) return kScaleBudgetGuess;
+    return std::chrono::nanoseconds(ns);
+}
+
+HANDLE AsyncSender::held_scale_event() {
+    if (!scale_done_) scale_done_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return scale_done_;
+}
+
+void AsyncSender::submit_packed422(const uint8_t* source, long pitch, unsigned width,
+                                   unsigned height, bool uyvy, std::int64_t media_100ns) {
+    const auto stamped = media_time(media_100ns);
+    capture_rate_.add(stamped);
     if (!connected_.load() || !source || width < 2 || height < 1) return;
     const size_t row = static_cast<size_t>(width) * 2u;
     incoming_.resize(row * height);
@@ -149,14 +283,30 @@ void AsyncSender::submit_packed422(const uint8_t* source, long pitch, unsigned w
     }
     std::lock_guard lock(mutex_);
     pending_.swap(incoming_);
-    publish_pending(uyvy ? PendingKind::Uyvy : PendingKind::Yuy2, width, height);
+    publish_pending(uyvy ? PendingKind::Uyvy : PendingKind::Yuy2, width, height, stamped);
+}
+
+void AsyncSender::submit_bgra(const uint8_t* source, long pitch, unsigned width, unsigned height,
+                              std::int64_t media_100ns) {
+    const auto stamped = media_time(media_100ns);
+    capture_rate_.add(stamped);
+    if (!connected_.load() || !source || width < 2 || height < 1) return;
+    const size_t row = static_cast<size_t>(width) * 4u;
+    incoming_.resize(row * height);
+    for (unsigned y = 0; y < height; ++y) {
+        std::memcpy(incoming_.data() + y * row, source + static_cast<ptrdiff_t>(y) * pitch, row);
+    }
+    std::lock_guard lock(mutex_);
+    pending_.swap(incoming_);
+    publish_pending(PendingKind::Bgra, width, height, stamped);
 }
 
 // Both 4:2:0 layouts are height * 1.5 rows of `pitch` bytes: two half-pitch I420
 // chroma rows fill one. Stored tightly packed.
 void AsyncSender::submit_planar420(const uint8_t* source, long pitch, unsigned width,
-                                   unsigned height, bool i420) {
-    capture_rate_.add(clock::now());
+                                   unsigned height, bool i420, std::int64_t media_100ns) {
+    const auto stamped = media_time(media_100ns);
+    capture_rate_.add(stamped);
     if (!connected_.load() || !source || width < 2 || height < 2 ||
         pitch < static_cast<long>(width)) {
         return;
@@ -169,16 +319,18 @@ void AsyncSender::submit_planar420(const uint8_t* source, long pitch, unsigned w
     }
     std::lock_guard lock(mutex_);
     pending_.swap(incoming_);
-    publish_pending(i420 ? PendingKind::I420 : PendingKind::Nv12, width, height);
+    publish_pending(i420 ? PendingKind::I420 : PendingKind::Nv12, width, height, stamped);
 }
 
-void AsyncSender::submit_mjpeg(const uint8_t* jpeg, size_t size, unsigned width, unsigned height) {
-    capture_rate_.add(clock::now());
+void AsyncSender::submit_mjpeg(const uint8_t* jpeg, size_t size, unsigned width, unsigned height,
+                               std::int64_t media_100ns) {
+    const auto stamped = media_time(media_100ns);
+    capture_rate_.add(stamped);
     if (!connected_.load() || !jpeg || size < 4 || width < 2 || height < 1) return;
     incoming_.assign(jpeg, jpeg + size);
     std::lock_guard lock(mutex_);
     pending_.swap(incoming_);
-    publish_pending(PendingKind::Mjpeg, width, height);
+    publish_pending(PendingKind::Mjpeg, width, height, stamped);
 }
 
 void AsyncSender::submit_pcm(const uint8_t* pcm, size_t bytes) {
@@ -214,6 +366,7 @@ AsyncSender::Statistics AsyncSender::take_statistics() {
     Statistics stats;
     stats.send_ms = static_cast<double>(send_microseconds_.exchange(0)) / 1000.0;
     stats.sent = sent_.exchange(0);
+    stats.duplicates = duplicates_.load();
     stats.replaced = replaced_.exchange(0);
     stats.errors = errors_.exchange(0);
     return stats;
@@ -261,6 +414,19 @@ void AsyncSender::restart_rate_lock() {
     recalibrate_.store(true);
 }
 
+void AsyncSender::reset_handoff() {
+    std::lock_guard lock(mutex_);
+    ++handoff_epoch_;
+    delivery_valid_ = false;
+    held_late_ = false;
+    held_ready_ = false;
+    delivery_offset_ = {};
+    media_origin_valid_ = false;
+    pending_ready_ = false;
+    pending_hold_ = false;
+    prepared_cv_.notify_all();
+}
+
 bool AsyncSender::measured_capture_rate(double& fps) {
     return capture_rate_.rate(kTrimCaptureSeconds, fps);
 }
@@ -304,7 +470,10 @@ void AsyncSender::start_workers() {
         std::lock_guard lock(mutex_);
         running_ = true;
         pending_ready_ = false;
+        pending_hold_ = false;
         prep_new_ = false;
+        held_ready_ = false;
+        scale_busy_.store(false);
         prep_write_ = 0;
         prep_ready_ = 1;
         prep_front_ = 2;
@@ -324,7 +493,11 @@ void AsyncSender::stop_workers() {
         std::lock_guard lock(mutex_);
         running_ = false;
         pending_ready_ = false;
+        pending_hold_ = false;
+        held_ready_ = false;
+        scale_busy_.store(false);
     }
+    if (scale_done_) SetEvent(scale_done_);
     audio_run_.store(false);
     pending_cv_.notify_all();
     prepared_cv_.notify_all();
@@ -413,6 +586,10 @@ void AsyncSender::prep_loop(VideoMode mode) {
         unsigned width = 0, height = 0;
         PendingKind kind = PendingKind::Yuy2;
         clock::time_point captured{};
+        clock::time_point source{};
+        clock::time_point started{};
+        uint64_t epoch = 0;
+        bool hold = false;
         {
             std::unique_lock lock(mutex_);
             pending_cv_.wait(lock, [this] { return !running_ || pending_ready_; });
@@ -421,12 +598,22 @@ void AsyncSender::prep_loop(VideoMode mode) {
             height = pending_h_;
             kind = pending_kind_;
             captured = pending_at_;
+            source = pending_source_;
+            started = pending_started_;
+            hold = pending_hold_;
+            epoch = pending_epoch_;
             frame.swap(pending_);
             pending_ready_ = false;
+            pending_hold_ = false;
         }
-        if (frame.empty()) continue;
+        if (frame.empty()) {
+            if (hold) finish_held_scale(false, PreparedField{}, epoch);
+            continue;
+        }
         PreparedField& out = prepared_[prep_write_];
         out.captured = captured;
+        out.source = source;
+        out.handoff_epoch = epoch;
         out.picked = clock::now();
         out.decode_ms = 0.0;
         out.convert_ms = out.lz4_ms = 0.0;
@@ -460,9 +647,31 @@ void AsyncSender::prep_loop(VideoMode mode) {
             sample.pitch = static_cast<long>(width) * 2;
             sample.pixels = SamplePixels::Uyvy;
             break;
+        case PendingKind::Bgra:
+            sample.pitch = static_cast<long>(width) * 4;
+            sample.pixels = SamplePixels::Bgra;
+            break;
         }
         const ViewSettings view{letterbox_.load(), crop_h_.load(), crop_v_.load()};
         const bool interlaced = is_interlaced(mode);
+        // A desktop picture is scaled ahead of its release. Both fields are
+        // finished first, so the release can send either one.
+        if (hold) {
+            const auto fail = [&] {
+                finish_held_scale(false, out, epoch);
+            };
+            if (!field_prep_.prepare_field(sample, mode, view, 0, true, out)) {
+                fail();
+                continue;
+            }
+            if (interlaced && !field_prep_.prepare_field(sample, mode, view, 1, true, out)) {
+                fail();
+                continue;
+            }
+            note_desktop_scale(clock::now() - started);
+            finish_held_scale(true, out, epoch);
+            continue;
+        }
         const uint8_t parity = interlaced ? next_parity_.load() : uint8_t{0};
         if (!field_prep_.prepare_field(sample, mode, view, parity, true, out)) continue;
         {
@@ -498,6 +707,7 @@ void AsyncSender::sender_loop() {
     LatencyProbe probe;
     FreeWatch free_watch;
     capture_unusual_.store(false);
+    duplicates_.store(0);
     const bool can_lock = rate_lock_.load();
     RateLock rate;
     rate.use_trim = can_lock && sender_.has_trim();
@@ -526,6 +736,8 @@ void AsyncSender::sender_loop() {
     for (;;) {
         bool fresh = false;
         bool at_deadline = false;
+        bool at_land = false;
+        bool track_phase = true;
         bool repeat_planned = false;
         bool send_black = false;
         {
@@ -539,19 +751,58 @@ void AsyncSender::sender_loop() {
             } else {
                 const bool wait_for_sample = rate.capture_clocked();
                 repeat_planned = wait_for_sample && rate.repeat_planned();
-                const auto wake = [&] { return !running_ || (wait_for_sample && prep_new_); };
+                // Any new sample wakes the wait. A late one does not go out then:
+                // it waits for the next refresh.
+                const auto sample_ready = [&] {
+                    return !running_ || (wait_for_sample && prep_new_ && !held_late_);
+                };
                 const auto deadline = sender_.next_frame_deadline(!wait_for_sample || repeat_planned);
-                if (!prepared_cv_.wait_until(lock, deadline - kSpinBeforeDeadline, wake)) {
-                    while (!wake() && clock::now() < deadline) {
+                const auto this_source = [&] {
+                    return prepared_[prep_ready_].handoff_epoch == handoff_epoch_;
+                };
+                const bool holding = wait_for_sample &&
+                                     (held_late_ || (prep_new_ && this_source() &&
+                                                     late_handoff(prepared_[prep_ready_])));
+                auto until = deadline;
+                if (holding) {
+                    const auto land = sender_.next_land(RateLock::kTrimLandMarginSeconds);
+                    if (land <= deadline) until = land;
+                }
+                const bool wait_for_land = holding && until != deadline;
+                if (!prepared_cv_.wait_until(lock, until - kSpinBeforeDeadline, sample_ready)) {
+                    while (!sample_ready() && clock::now() < until) {
                         lock.unlock();
                         std::this_thread::yield();
                         lock.lock();
                     }
-                    at_deadline = !wake();
+                    if (!sample_ready()) {
+                        at_land = wait_for_land;
+                        at_deadline = !wait_for_land;
+                    }
                 }
             }
             if (!running_) break;
-            if (prep_new_) {
+            const auto this_source = [&] {
+                return prepared_[prep_ready_].handoff_epoch == handoff_epoch_;
+            };
+            if (prep_new_ && held_late_ && at_land && this_source()) {
+                const bool late = late_handoff(prepared_[prep_ready_]);
+                if (!late) note_handoff(prepared_[prep_ready_]);
+                track_phase = !late;
+                held_late_ = false;
+                std::swap(prep_ready_, prep_front_);
+                prep_new_ = false;
+                fresh = true;
+                have_frame = true;
+            } else if (prep_new_ && have_frame && this_source() &&
+                       late_handoff(prepared_[prep_ready_])) {
+                held_late_ = true;
+            } else if (prep_new_) {
+                // A frame from the previous graph can still be sent. It must not
+                // become the new source's idea of on time.
+                if (this_source()) note_handoff(prepared_[prep_ready_]);
+                else track_phase = false;
+                held_late_ = false;
                 std::swap(prep_ready_, prep_front_);
                 prep_new_ = false;
                 fresh = true;
@@ -587,6 +838,7 @@ void AsyncSender::sender_loop() {
         next_parity_.store(sender_.last_parity() ^ 1u);
         send_microseconds_.fetch_add(static_cast<uint64_t>(elapsed_ms * 1000.0 + 0.5));
         sent_.fetch_add(1);
+        if (!fresh) duplicates_.fetch_add(1);
         rate.note_send(fresh);
         if (!fresh && rate.capture_clocked() && !repeat_planned) ++rate.repeats;
         if (timing_log_.load()) {
@@ -604,7 +856,8 @@ void AsyncSender::sender_loop() {
             continue;
         }
         if (!fresh) continue;
-        const RateLock::Action action = rate.after_send(sender_, field.captured);
+        const RateLock::Action action =
+            rate.after_send(sender_, field.captured, field.source, track_phase);
         publish_rate_log();
         if (action == RateLock::Action::Restart) {
             // Free-run on the current clock until the main thread calibrates again.

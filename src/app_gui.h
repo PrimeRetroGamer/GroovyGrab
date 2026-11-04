@@ -20,7 +20,7 @@ struct Stats {
     uint64_t present_skips = 0;
     double mister_ms = 0.0;
     double decode_ms = 0.0; // MJPEG only
-    uint64_t mister_sent = 0;
+    uint64_t mister_duplicates = 0;
     uint64_t mister_replaced = 0;
     uint64_t mister_errors = 0;
     std::string mister_error;

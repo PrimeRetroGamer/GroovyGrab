@@ -8,9 +8,9 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <chrono>
 #include <condition_variable>
-#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,7 +32,7 @@ public:
     AsyncSender() = default;
     AsyncSender(const AsyncSender&) = delete;
     AsyncSender& operator=(const AsyncSender&) = delete;
-    ~AsyncSender() { close(); }
+    ~AsyncSender();
 
     // Connects on its own thread: waiting for Groovy's INIT ACK must not stall
     // the window.
@@ -47,11 +47,27 @@ public:
     void set_view(const ViewSettings& view);
 
     // Capture callbacks. `pitch` is the row stride (luma stride for 4:2:0).
+    // media_100ns is the sample's own timestamp, in 100 ns units, or -1 if it has none.
     void submit_packed422(const uint8_t* source, long pitch, unsigned width, unsigned height,
-                          bool uyvy);
+                          bool uyvy, std::int64_t media_100ns);
+    // B8G8R8A8, tightly stored after the copy. Alpha is not used.
+    void submit_bgra(const uint8_t* source, long pitch, unsigned width, unsigned height,
+                     std::int64_t media_100ns);
+    // Scale a desktop picture as it arrives and hold it until release_held_frame().
+    // Those releases are the stream. scale_budget() is how long a picture needs,
+    // so a newer one starts only when it can finish in time.
+    bool submit_bgra_held(const uint8_t* source, long pitch, unsigned width, unsigned height);
+    // One beat of the desktop clock. Counted from the start, so the rate is known
+    // before the stream begins.
+    void note_desktop_tick();
+    bool release_held_frame();
+    std::chrono::nanoseconds scale_budget() const;
+    bool desktop_scale_busy() const { return scale_busy_.load(); }
+    HANDLE held_scale_event();
     void submit_planar420(const uint8_t* source, long pitch, unsigned width, unsigned height,
-                          bool i420);
-    void submit_mjpeg(const uint8_t* jpeg, size_t size, unsigned width, unsigned height);
+                          bool i420, std::int64_t media_100ns);
+    void submit_mjpeg(const uint8_t* jpeg, size_t size, unsigned width, unsigned height,
+                      std::int64_t media_100ns);
     void submit_pcm(const uint8_t* pcm, size_t bytes);
 
     // Latest decoded MJPEG frame as RGB24; false if nothing newer than `seen`.
@@ -61,6 +77,7 @@ public:
     struct Statistics {
         double send_ms = 0.0; // total
         uint64_t sent = 0, replaced = 0, errors = 0;
+        uint64_t duplicates = 0; // repeated pictures sent since this stream started
     };
     Statistics take_statistics();
     // Average MJPEG decode time since the last call (0 if none).
@@ -90,13 +107,16 @@ public:
     void set_rate_lock(bool enabled) { rate_lock_.store(enabled); }
     // The capture was reopened and its rate is unknown: measure again.
     void restart_rate_lock();
+    // The capture graph was replaced. The next source learns its own stamp-to-arrival
+    // gap; a frame already in flight from the old graph does not set it.
+    void reset_handoff();
     // The source changed during a stream: call start_recalibrate() to show the
     // Calibrating image and time it again.
     bool recalibrate_needed() const { return rate_lock_.load() && recalibrate_.load(); }
     void start_recalibrate();
 
 private:
-    enum class PendingKind { Yuy2, Uyvy, Mjpeg, Nv12, I420 };
+    enum class PendingKind { Yuy2, Uyvy, Mjpeg, Nv12, I420, Bgra };
 
     // Capture timing wanted before planning a rate.
     static constexpr double kCaptureMeasureSeconds = 5.0;
@@ -126,7 +146,14 @@ private:
     void report_sender_error();
     void add_log(const std::string& text);
 
-    void publish_pending(PendingKind kind, unsigned width, unsigned height);
+    void publish_pending(PendingKind kind, unsigned width, unsigned height,
+                         std::chrono::steady_clock::time_point source, bool hold = false,
+                         std::chrono::steady_clock::time_point started = {});
+    void note_desktop_scale(std::chrono::nanoseconds cost);
+    void finish_held_scale(bool keep, const PreparedField& field, uint64_t epoch);
+    std::chrono::steady_clock::time_point media_time(std::int64_t sample_100ns);
+    bool late_handoff(const PreparedField& field) const;
+    void note_handoff(const PreparedField& field);
     void publish_preview(const uint8_t* rgb, unsigned width, unsigned height);
     bool decode_mjpeg(const std::vector<uint8_t>& jpeg, unsigned width, unsigned height,
                       std::vector<uint8_t>& rgb, double& decode_ms);
@@ -160,6 +187,17 @@ private:
     std::vector<uint8_t> pending_;
     std::vector<uint8_t> incoming_; // capture thread only: filled outside the lock
     std::chrono::steady_clock::time_point pending_at_{};
+    std::chrono::steady_clock::time_point pending_source_{};
+    std::chrono::steady_clock::time_point pending_started_{};
+    bool pending_hold_ = false;
+    PreparedField held_;
+    bool held_ready_ = false;
+    std::atomic<bool> scale_busy_{false};
+    HANDLE scale_done_ = nullptr;
+    std::array<std::chrono::nanoseconds, 8> scale_ring_{};
+    int scale_ring_pos_ = 0;
+    int scale_ring_count_ = 0;
+    std::atomic<std::int64_t> scale_budget_ns_{0};
     unsigned pending_w_ = 0;
     unsigned pending_h_ = 0;
     PendingKind pending_kind_ = PendingKind::Yuy2;
@@ -194,6 +232,18 @@ private:
     std::vector<std::chrono::steady_clock::time_point> relocks_;
     std::chrono::steady_clock::time_point free_until_{};
     CaptureRateMeter capture_rate_;
+    // How long after its timestamp a picture usually arrives, from the last one
+    // that was on time. A later picture repeats this refresh and goes out on the
+    // next one. handoff_epoch_ advances when the capture graph is replaced, so
+    // the delay is learned again.
+    uint64_t handoff_epoch_ = 0;
+    uint64_t pending_epoch_ = 0;
+    bool delivery_valid_ = false;
+    bool held_late_ = false;
+    std::chrono::steady_clock::duration delivery_offset_{};
+    bool media_origin_valid_ = false;
+    std::int64_t media_origin_ = 0;
+    std::chrono::steady_clock::time_point media_steady_{};
     RatePlan start_plan_;
     double start_fps_ = 0.0;
     double mister_clock_ = 1.0; // this MiSTer's actual rate relative to the one asked for
@@ -206,6 +256,7 @@ private:
     std::atomic<uint64_t> decoded_frames_{0};
     std::atomic<uint64_t> send_microseconds_{0};
     std::atomic<uint64_t> sent_{0};
+    std::atomic<uint64_t> duplicates_{0};
     std::atomic<uint64_t> replaced_{0};
     std::atomic<uint64_t> errors_{0};
 };

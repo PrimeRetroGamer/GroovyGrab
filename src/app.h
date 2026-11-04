@@ -5,6 +5,7 @@
 #include "app_gui.h"
 #include "async_sender.h"
 #include "audio_capture.h"
+#include "desktop_capture.h"
 #include "directshow_capture.h"
 #include "format_menu.h"
 #include "jpeg_decode.h"
@@ -84,6 +85,7 @@ private:
     clock::time_point next_open_ = clock::now();
 
     std::unique_ptr<directshow_capture::Capture> capture_;
+    std::unique_ptr<desktop_capture::DesktopCapture> desktop_;
     std::unique_ptr<directshow_capture::AudioCapture> audio_;
     uint32_t audio_rate_hz_ = 0;
 

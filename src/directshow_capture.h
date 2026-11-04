@@ -135,7 +135,7 @@ private:
 };
 
 struct VideoFormat {
-    enum class PixelFormat { yuy2, mjpeg, nv12, i420, uyvy };
+    enum class PixelFormat { yuy2, mjpeg, nv12, i420, uyvy, bgra };
 
     int width = 0;
     int height = 0;
@@ -171,8 +171,10 @@ public:
     // Called on the driver's thread. size is the byte count; pitch is the row
     // stride (luma stride for 4:2:0), or 0 for a JPEG. Uncompressed rows are
     // always tightly packed here, whatever the driver delivers.
+    // media_100ns is the sample's own timestamp, in 100 ns units, or -1 if the
+    // driver did not stamp it.
     using FrameFn = std::function<void(const uint8_t* data, long size, long pitch,
-                                       const VideoFormat& format)>;
+                                       const VideoFormat& format, LONGLONG media_100ns)>;
 
     Capture(const std::wstring& device_name, VideoFormat format, FrameFn on_frame);
 

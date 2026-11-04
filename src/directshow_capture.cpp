@@ -110,6 +110,7 @@ constexpr PixelFormatNames kPixelFormats[] = {
     {PixelFormat::mjpeg, "MJPEG", "mjpeg"},
     {PixelFormat::nv12, "NV12", "nv12"},
     {PixelFormat::i420, "I420", "i420"},
+    {PixelFormat::bgra, "BGRA", "bgra"},
 };
 
 const PixelFormatNames& pixel_format_names(PixelFormat format) {
@@ -430,6 +431,7 @@ PixelFormat pixel_format_from_setting(const std::string& value) {
 
 long source_stride(const VideoFormat& format, DWORD image_size) {
     constexpr long kMaxRowPadding = 256;
+    if (format.pixel_format == PixelFormat::bgra) return format.width * 4;
     const bool planar = planar_420(format.pixel_format);
     const long tight = planar ? format.width : format.width * 2;
     const long rows = planar ? format.height + format.height / 2 : format.height;
@@ -467,6 +469,7 @@ void pack_rows_tight(const uint8_t* source, long stride, const VideoFormat& form
         copy_rows(width / 2, height, stride / 2); // U then V, h/2 rows each
         break;
     case PixelFormat::mjpeg:
+    case PixelFormat::bgra:
         break;
     }
 }
@@ -596,8 +599,7 @@ public:
 
 protected:
     HRESULT on_sample(BYTE* source, long length, IMediaSample* sample) override {
-        // The driver's thread, at normal priority: under load, samples then arrive late
-        // enough for the rate lock to see a source that changes rate.
+        // Raise this thread once. The stamp is read here and passed to the frame callback.
         if (!thread_raised_) {
             thread_raised_ = true;
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -612,9 +614,9 @@ protected:
             pack_rows_tight(source, stride_, format_, tight_.data());
             data = tight_.data();
         }
-        on_frame_(data, kept, pitch_, format_);
         REFERENCE_TIME start = 0, stop = 0;
-        if (FAILED(sample->GetTime(&start, &stop))) start = -1;
+        if (!sample || FAILED(sample->GetTime(&start, &stop))) start = -1;
+        on_frame_(data, kept, pitch_, format_, start);
         count_sample(start);
         {
             std::lock_guard lock(mutex_);

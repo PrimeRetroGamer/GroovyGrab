@@ -143,6 +143,16 @@ const uint8_t* FieldPrep::row_triplets(const Sample& sample, unsigned y) {
     switch (sample.pixels) {
     case SamplePixels::Rgb:
         return row;
+    case SamplePixels::Bgra:
+        row_.resize(static_cast<size_t>(width) * 3u);
+        for (unsigned x = 0; x < width; ++x) {
+            const uint8_t* pixel = row + static_cast<ptrdiff_t>(x) * 4;
+            uint8_t* out = row_.data() + static_cast<size_t>(x) * 3u;
+            out[0] = pixel[2];
+            out[1] = pixel[1];
+            out[2] = pixel[0];
+        }
+        return row_.data();
     case SamplePixels::Yuy2:
         decode_yuy2_row(row, width, row_.data());
         break;
@@ -243,7 +253,8 @@ void FieldPrep::convert(const Sample& sample, unsigned out_h, bool field_only,
         }
         if (fast) {
             std::memset(output, 0, map.dst_x0 * sizeof(uint16_t));
-            avx2_->finish_row(sample.pixels == SamplePixels::Rgb, output + map.dst_x0);
+            avx2_->finish_row(sample.pixels == SamplePixels::Rgb || sample.pixels == SamplePixels::Bgra,
+                              output + map.dst_x0);
             std::memset(output + map.dst_x1, 0, (kOutputWidth - map.dst_x1) * sizeof(uint16_t));
             continue;
         }
@@ -255,7 +266,7 @@ void FieldPrep::convert(const Sample& sample, unsigned out_h, bool field_only,
         std::memset(output, 0, map.dst_x0 * sizeof(uint16_t));
         const uint8_t* in = scaled_.data();
         uint16_t* out = output + map.dst_x0;
-        if (sample.pixels == SamplePixels::Rgb) {
+        if (sample.pixels == SamplePixels::Rgb || sample.pixels == SamplePixels::Bgra) {
             for (unsigned x = 0; x < dest_w; ++x, in += 3) out[x] = pack565(in[0], in[1], in[2]);
         } else {
             for (unsigned x = 0; x < dest_w; ++x, in += 3) out[x] = yuv_to_565(in[0], in[1], in[2]);

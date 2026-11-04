@@ -146,6 +146,24 @@ void Avx2Rows::load_row(const Sample& sample, unsigned y) {
         }
         break;
     }
+    case SamplePixels::Bgra: {
+        const __m128i rs = _mm_setr_epi8(2, 6, 10, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        const __m128i gs = _mm_setr_epi8(1, 5, 9, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        const __m128i bs = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        for (; x + 4 <= width; x += 4) {
+            const __m128i in = _mm_loadu_si128(as_m128(row + x * 4));
+            store8(p0 + x, _mm_shuffle_epi8(in, rs));
+            store8(p1 + x, _mm_shuffle_epi8(in, gs));
+            store8(p2 + x, _mm_shuffle_epi8(in, bs));
+        }
+        for (; x < width; ++x) {
+            const uint8_t* pixel = row + x * 4;
+            p0[x] = pixel[2];
+            p1[x] = pixel[1];
+            p2[x] = pixel[0];
+        }
+        break;
+    }
     case SamplePixels::Yuy2:
     case SamplePixels::Uyvy: {
         const bool yuy2 = sample.pixels == SamplePixels::Yuy2;

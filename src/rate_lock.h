@@ -52,6 +52,9 @@ struct RateLock {
     // is about 1.3 ms of blanking before line 0. The sum must stay above the
     // sender's repeat lead (1.8 ms).
     static constexpr double kLandMarginSeconds = 0.0015;
+    // Where an on-time send is held. A picture that arrives later than this,
+    // against its own timestamp, has missed this refresh and waits for the next one.
+    static constexpr double kTrimLandMarginSeconds = 0.002;
     // MiSTer's pixel clock comes from its crystal, so its real rate is within
     // this of the nominal one (~10 ppm in practice). A noisier measurement is
     // clamped; one above kNoisyFitMs is replaced by the nominal rate.
@@ -84,8 +87,12 @@ struct RateLock {
 
     void note_send(bool fresh) { slots_since_sample = fresh ? 0 : slots_since_sample + 1; }
 
-    // After sending a new sample.
-    Action after_send(const Sender& sender, clock::time_point captured);
+    // After sending a new sample. `source` is the sample's own timestamp, which is
+    // what its rate is measured from. `arrived` is when this process received it.
+    // `track_phase` is false when this frame missed its land and was sent on the
+    // next one: its rate still counts, and it does not move the landing point.
+    Action after_send(const Sender& sender, clock::time_point arrived, clock::time_point source,
+                      bool track_phase);
 
 private:
     static constexpr auto kWarmup = std::chrono::seconds(1);
@@ -115,7 +122,8 @@ private:
 
     void reset_windows(clock::time_point now);
     void record_gap(double gap_ms);
-    Action update_clock(const Sender& sender, clock::time_point captured, clock::time_point now);
+    Action update_clock(const Sender& sender, clock::time_point arrived, clock::time_point source,
+                        clock::time_point now);
     double median_gap_ms() const;
     bool rates(const Sender& sender, double& capture_fps, double& raster_fps);
     Action correct_rate(const Sender& sender, double capture_fps, double raster_fps, const char* why);
@@ -131,9 +139,6 @@ private:
     static constexpr double kTrimIntegral = 3.75;  // ppm per frame of error, per second
     static constexpr double kTrimLimit = 190.0;    // about one clock tick a line
     static constexpr double kTrimResend = 0.25;    // ppm: smaller changes are not sent
-    // Lands a little further from the deadline than the slide does: a loop that holds
-    // the phase there has no reason to run close to it.
-    static constexpr double kTrimLandMarginSeconds = 0.002;
     // Capture timing can step with no sample missing. That is a new position, not a new
     // rate: the integral stays out of it, and a higher gain moves the raster back in
     // seconds, as a late step would otherwise eat the margin for half a minute.

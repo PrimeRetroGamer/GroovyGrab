@@ -1,5 +1,6 @@
 #include "format_menu.h"
 
+#include "desktop_capture.h"
 #include "video_mode.h"
 
 #include <windows.h>
@@ -79,6 +80,8 @@ void FormatMenu::refresh_devices(bool allow_substring) {
     // A card's id changes when an identical one comes or goes; its path does not.
     const std::wstring keep_path = listed ? devices_[static_cast<size_t>(gui_.device_index)].path : L"";
     devices_ = directshow_capture::list_video_devices();
+    const auto monitors = desktop_capture::list_monitors();
+    devices_.insert(devices_.end(), monitors.begin(), monitors.end());
     gui_.devices = display_names(devices_);
     int exact = -1;
     int partial = -1;
@@ -168,6 +171,24 @@ int FormatMenu::audio_of_video_device() const {
 }
 
 void FormatMenu::load_formats(bool keep_format) {
+    if (desktop_capture::is_monitor(device)) {
+        formats_.clear();
+        const auto format = desktop_capture::format_of(device);
+        device_default_ = {};
+        if (format.width >= 2) {
+            for (double fps : {50.0, 60.0}) {
+                auto rate = format;
+                rate.fps = fps;
+                rate.frame_time = fps == 50.0 ? 200000 : 10'000'000 / 60;
+                if (fps == 60.0) device_default_ = rate;
+                formats_.push_back(std::move(rate));
+            }
+        }
+        if (!keep_format || formats_.empty()) selected = device_default_;
+        rebuild(true);
+        use_listed_format();
+        return;
+    }
     formats_ = directshow_capture::list_video_formats(device);
     device_default_ = directshow_capture::default_video_format(device);
     const bool offered = std::any_of(formats_.begin(), formats_.end(), [&](const VideoFormat& format) {
@@ -234,7 +255,9 @@ void FormatMenu::rebuild(bool from_selected) {
             std::find(size_keys.begin(), size_keys.end(), key) != size_keys.end()) {
             continue;
         }
-        if (key == default_size && default_pixel) gui_.default_size_index = static_cast<int>(size_keys.size());
+        if (!desktop_capture::is_monitor(device) && key == default_size && default_pixel) {
+            gui_.default_size_index = static_cast<int>(size_keys.size());
+        }
         size_keys.push_back(key);
         char text[64];
         std::snprintf(text, sizeof(text), "%d x %d", key.first, key.second);
@@ -253,7 +276,8 @@ void FormatMenu::rebuild(bool from_selected) {
             return std::abs(fps - format.fps) < kSameRate;
         });
         if (seen) continue;
-        if (size == default_size && default_pixel && std::abs(format.fps - device_default_.fps) < kSameRate) {
+        if (!desktop_capture::is_monitor(device) && size == default_size && default_pixel &&
+            std::abs(format.fps - device_default_.fps) < kSameRate) {
             gui_.default_rate_index = static_cast<int>(rate_keys.size());
         }
         rate_keys.push_back(format.fps);

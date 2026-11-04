@@ -89,6 +89,10 @@ public:
     // leaves more margin, for a frame with no sample to wait for.
     clock::time_point next_frame_deadline(bool early) const;
 
+    // Next time the beam reaches the usual send point: release_fraction minus
+    // `margin_seconds`. A frame that missed this field's land goes out here.
+    clock::time_point next_land(double margin_seconds) const;
+
     // Raster position (blit periods, fractional) at the most recent ACK for one
     // of our fields, and when that ACK arrived.
     bool raster_sample(double& position, clock::time_point& at) const;

@@ -216,7 +216,7 @@ void App::rebuild_fonts() {
 // stops and the first available device takes over. A saved device that has returned
 // takes over again once no stream is running.
 void App::update_devices() {
-    const bool had_capture = capture_ != nullptr;
+    const bool had_capture = capture_ != nullptr || desktop_ != nullptr;
     const std::wstring previous_audio = menu_.audio();
     const std::vector<std::string> previous_names = gui_.devices;
     const std::vector<std::string> previous_audio_names = gui_.audio_devices;
@@ -255,6 +255,7 @@ void App::use_saved_format() {
 
 void App::open_capture() {
     close_capture();
+    mister_.reset_handoff();
     mister_.restart_rate_lock();
     gui_.stats.capture_error.clear();
     if (!menu_.has_devices()) {
@@ -262,23 +263,40 @@ void App::open_capture() {
         return;
     }
     try {
-        capture_ = std::make_unique<directshow_capture::Capture>(
-            menu_.device, menu_.selected,
-            [this](const uint8_t* data, long size, long pitch,
-                   const directshow_capture::VideoFormat& format) {
+        if (desktop_capture::is_monitor(menu_.device)) {
+            desktop_capture::TickHooks hooks;
+            hooks.start = [this](const uint8_t* data, long pitch, unsigned width, unsigned height) {
+                return mister_.submit_bgra_held(data, pitch, width, height);
+            };
+            hooks.tick = [this] { mister_.note_desktop_tick(); };
+            hooks.release = [this] { return mister_.release_held_frame(); };
+            hooks.budget = [this] { return mister_.scale_budget(); };
+            hooks.busy = [this] { return mister_.desktop_scale_busy(); };
+            hooks.scale_done = mister_.held_scale_event();
+            desktop_ = std::make_unique<desktop_capture::DesktopCapture>(
+                menu_.device, std::move(hooks), menu_.selected.fps);
+            menu_.set_active_format(desktop_->format());
+        } else {
+            capture_ = std::make_unique<directshow_capture::Capture>(
+                menu_.device, menu_.selected,
+                [this](const uint8_t* data, long size, long pitch,
+                   const directshow_capture::VideoFormat& format, LONGLONG media_100ns) {
                 // Runs on the driver's thread, before the preview ever sees the sample.
                 const unsigned w = static_cast<unsigned>(format.width);
                 const unsigned h = static_cast<unsigned>(format.height);
                 if (format.pixel_format == PixelFormat::mjpeg) {
-                    mister_.submit_mjpeg(data, static_cast<size_t>(size), w, h);
+                    mister_.submit_mjpeg(data, static_cast<size_t>(size), w, h, media_100ns);
                 } else if (format.pixel_format == PixelFormat::yuy2 ||
                            format.pixel_format == PixelFormat::uyvy) {
-                    mister_.submit_packed422(data, pitch, w, h, format.pixel_format == PixelFormat::uyvy);
+                    mister_.submit_packed422(data, pitch, w, h, format.pixel_format == PixelFormat::uyvy,
+                                             media_100ns);
                 } else {
-                    mister_.submit_planar420(data, pitch, w, h, format.pixel_format == PixelFormat::i420);
+                    mister_.submit_planar420(data, pitch, w, h, format.pixel_format == PixelFormat::i420,
+                                             media_100ns);
                 }
             });
-        menu_.set_active_format(capture_->format());
+            menu_.set_active_format(capture_->format());
+        }
     } catch (const std::exception& error) {
         gui_.stats.capture_error = dynamic_cast<const directshow_capture::UnsupportedFormat*>(&error)
                                        ? "This device can't use the selected format"
@@ -312,6 +330,7 @@ void App::close_capture() {
     audio_rate_hz_ = 0;
     gui_.stats.audio_error.clear();
     capture_.reset();
+    desktop_.reset();
     renderer_.clear_image();
     last_sample_at_ = {};
 }
@@ -319,9 +338,19 @@ void App::close_capture() {
 // Takes the latest sample for the preview and the source statistics. Streaming
 // does not depend on this: the capture callback has already submitted it.
 bool App::poll_capture(DWORD timeout_ms) {
-    if (!capture_) {
+    if (!capture_ && !desktop_) {
         if (timeout_ms) Sleep(16);
         return false;
+    }
+    if (desktop_) {
+        LONGLONG timestamp = 0;
+        if (!desktop_->wait_for_sample(sample_, timestamp, timeout_ms)) return false;
+        const auto& format = desktop_->format();
+        renderer_.upload_bgra(sample_.data(), format.width * 4, static_cast<UINT>(format.width),
+                              static_cast<UINT>(format.height));
+        latest_drops_ += desktop_->take_replaced_samples();
+        last_sample_at_ = clock::now();
+        return true;
     }
     LONGLONG timestamp = 0;
     const bool got_sample = capture_->wait_for_sample(sample_, timestamp, timeout_ms);
@@ -389,7 +418,7 @@ void App::manage_stream() {
         next_open_ = clock::now();
     }
     // Nothing to stream: a capture that failed to open or could not be reopened.
-    if (!capture_) gui_.stream = false;
+    if (!capture_ && !desktop_) gui_.stream = false;
     if (gui_.stream && !mister_.connected()) {
         stream_announced_ = false;
         const auto now = clock::now();
@@ -447,9 +476,9 @@ void App::draw_frame(bool from_main_loop) {
     gui_.stats.mister_error = mister_.error();
     gui_.stats.audio_rate_hz = audio_rate_hz_;
     gui_.stats.allocator_buffers = capture_ ? capture_->buffer_count() : -1;
-    gui_.stats.capture_warning = mister_.capture_unusual() ? "Capture rate is unusual. Is the source on?" : "";
-    gui_.has_capture = capture_ != nullptr;
-    gui_.has_video = capture_ && last_sample_at_ != clock::time_point{} &&
+    gui_.stats.capture_warning = mister_.capture_unusual() ? "Capture rate is free-running" : "";
+    gui_.has_capture = capture_ != nullptr || desktop_ != nullptr;
+    gui_.has_video = (capture_ || desktop_) && last_sample_at_ != clock::time_point{} &&
                      clock::now() - last_sample_at_ < kVideoTimeout;
     app_gui::draw(gui_);
     renderer_.draw(gui_.video_x, gui_.video_y, gui_.video_w, gui_.video_h, gui_.letterbox,
@@ -534,8 +563,8 @@ void App::update_statistics() {
 
     const auto sent = mister_.take_statistics();
     auto& stats = gui_.stats;
-    const uint64_t samples = capture_ ? capture_->take_samples() : 0;
-    const uint64_t source_gaps = capture_ ? capture_->take_gaps() : 0;
+    const uint64_t samples = capture_ ? capture_->take_samples() : desktop_ ? desktop_->take_samples() : 0;
+    const uint64_t source_gaps = capture_ ? capture_->take_gaps() : desktop_ ? desktop_->take_gaps() : 0;
     stats.fps = static_cast<double>(samples) / elapsed;
     stats.app_ms = processing_ms_sum_ / static_cast<double>(std::max<uint64_t>(1, loops_));
     stats.source_gaps = source_gaps;
@@ -543,7 +572,7 @@ void App::update_statistics() {
     stats.present_skips = present_skips_;
     stats.mister_ms = sent.send_ms / static_cast<double>(std::max<uint64_t>(1, sent.sent));
     stats.decode_ms = mister_.take_decode_ms();
-    stats.mister_sent = sent.sent;
+    stats.mister_duplicates = sent.duplicates;
     stats.mister_replaced = sent.replaced;
     stats.mister_errors = sent.errors;
     if (print_stats_) {

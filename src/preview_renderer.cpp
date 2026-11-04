@@ -263,6 +263,20 @@ void PreviewRenderer::upload_rgb(const uint8_t* rgb, LONG pitch, UINT width, UIN
     image_is_rgb = true;
 }
 
+void PreviewRenderer::upload_bgra(const uint8_t* bgra, LONG pitch, UINT width, UINT height) {
+    ensure_textures(width, height);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    check(context->Map(bgra_texture.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped),
+          "Map(BGRA preview texture)");
+    for (UINT y = 0; y < height; ++y) {
+        std::memcpy(static_cast<uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+                    bgra + static_cast<ptrdiff_t>(y) * pitch, static_cast<size_t>(width) * 4u);
+    }
+    context->Unmap(bgra_texture.Get(), 0);
+    has_image = true;
+    image_is_rgb = true;
+}
+
 void PreviewRenderer::upload_yuy2(const uint8_t* yuy2, LONG pitch, UINT width, UINT height) {
     ensure_textures(width, height);
     D3D11_MAPPED_SUBRESOURCE mapped{};

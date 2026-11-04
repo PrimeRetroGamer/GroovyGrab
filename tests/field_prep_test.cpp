@@ -26,6 +26,10 @@ std::vector<uint8_t> make_frame(SamplePixels pixels, unsigned width, unsigned he
         pitch = static_cast<long>(width) * 3;
         bytes = static_cast<size_t>(pitch) * height;
         break;
+    case SamplePixels::Bgra:
+        pitch = static_cast<long>(width) * 4;
+        bytes = static_cast<size_t>(pitch) * height;
+        break;
     case SamplePixels::Yuy2:
     case SamplePixels::Uyvy:
         pitch = static_cast<long>(width) * 2;
@@ -58,7 +62,7 @@ int main() {
         return 0;
     }
     const Format formats[] = {{"YUY2", SamplePixels::Yuy2}, {"UYVY", SamplePixels::Uyvy}, {"NV12", SamplePixels::Nv12},
-                              {"I420", SamplePixels::I420}, {"RGB", SamplePixels::Rgb}};
+                              {"I420", SamplePixels::I420}, {"RGB", SamplePixels::Rgb}, {"BGRA", SamplePixels::Bgra}};
     const unsigned sizes[][2] = {{1280, 720}, {1920, 1080}, {3840, 2160}, {720, 480}, {720, 576}, {640, 480}, {854, 480},
                                  {1366, 768}, {1024, 768},  {800, 600},   {320, 240}, {160, 120}, {2, 2},     {6, 4},
                                  {1282, 722}, {7680, 4320}}; // the last takes more taps than AVX2 handles

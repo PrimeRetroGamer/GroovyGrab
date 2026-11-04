@@ -17,9 +17,10 @@ class Avx2Rows;
 //   Yuy2: packed 4:2:2, Y0 U Y1 V.
 //   Uyvy: packed 4:2:2, U Y0 V Y1.
 //   Rgb:  packed RGB24 (decoded MJPEG).
+//   Bgra: packed B8G8R8A8, the desktop's own bytes. Alpha is ignored.
 //   Nv12: Y plane, then interleaved UV at half height, same row pitch.
 //   I420: Y plane, then U and V planes at half width and height.
-enum class SamplePixels { Yuy2, Uyvy, Rgb, Nv12, I420 };
+enum class SamplePixels { Yuy2, Uyvy, Rgb, Nv12, I420, Bgra };
 
 struct Sample {
     const uint8_t* data = nullptr;
@@ -45,6 +46,8 @@ struct PreparedField {
     std::array<std::atomic<bool>, 2> ready{};
     double decode_ms = 0.0, convert_ms = 0.0, lz4_ms = 0.0;
     std::chrono::steady_clock::time_point captured{}, picked{};
+    std::chrono::steady_clock::time_point source{}; // the sample's own timestamp
+    uint64_t handoff_epoch = 0; // which capture graph this sample came from
 };
 
 // Scales a capture sample to 720 x field height (separable box filter), packs
