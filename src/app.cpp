@@ -343,6 +343,8 @@ bool App::poll_capture(DWORD timeout_ms) {
         return false;
     }
     if (desktop_) {
+        // A still desktop sends nothing new, so being read counts as receiving video.
+        if (desktop_->live()) last_sample_at_ = clock::now();
         LONGLONG timestamp = 0;
         if (!desktop_->wait_for_sample(sample_, timestamp, timeout_ms)) return false;
         const auto& format = desktop_->format();
@@ -416,13 +418,16 @@ void App::manage_stream() {
             mister_.close();
         }
         next_open_ = clock::now();
+        mister_.clear_wrong_core();
     }
+    // Stopping the stream, then starting it again, tries the MiSTer once more.
+    if (!gui_.stream) mister_.clear_wrong_core();
     // Nothing to stream: a capture that failed to open or could not be reopened.
     if (!capture_ && !desktop_) gui_.stream = false;
     if (gui_.stream && !mister_.connected()) {
         stream_announced_ = false;
         const auto now = clock::now();
-        if (!mister_.opening() && now >= next_open_) {
+        if (!mister_.opening() && now >= next_open_ && !mister_.wrong_core()) {
             next_open_ = now + std::chrono::seconds(2);
             active_mode_ = wanted_mode();
             connected_ip_ = address_;

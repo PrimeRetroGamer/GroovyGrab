@@ -39,7 +39,7 @@ constexpr size_t kMaxQueuedAudioBytes = 48000u * 4u / 25u; // 40 ms of 48 kHz st
 constexpr auto kFreeWindow = std::chrono::seconds(5);
 constexpr double kFreeAgreement = 0.001;
 // More relocks than this in the time below means the source won't hold still: it stays
-// free-running for that long, so the Calibrating image doesn't keep coming back.
+// free-running for that long, so the stream doesn't keep restarting.
 constexpr size_t kMaxRelocks = 3;
 constexpr auto kRelockWindow = std::chrono::minutes(2);
 
@@ -62,6 +62,11 @@ bool AsyncSender::open(const std::string& ip, VideoMode mode, uint32_t audio_rat
     free_until_ = {};
     if (!sender_.open(ip, mode, audio_rate_hz, 1.0)) {
         report_sender_error();
+        if (sender_.wrong_core()) {
+            // End the session it opened, so that core goes back to its own screen.
+            sender_.close();
+            wrong_core_.store(true);
+        }
         return false;
     }
     return calibrate_and_start(mode);
@@ -154,19 +159,17 @@ std::chrono::steady_clock::time_point AsyncSender::media_time(std::int64_t sampl
     return media_steady_ + ticks;
 }
 
-// A picture normally arrives a steady delay after its timestamp. One that
-// arrives much later repeats the previous picture for this refresh and goes
-// out on the next one. The delay stays based on pictures that were on time.
-bool AsyncSender::late_handoff(const PreparedField& field) const {
-    if (!delivery_valid_) return false;
-    const auto extra = (field.captured - field.source) - delivery_offset_;
-    const double limit_ms = RateLock::kTrimLandMarginSeconds * 1000.0;
-    return std::chrono::duration<double, std::milli>(extra).count() > limit_ms;
+// How long after its timestamp a picture arrives. A capture card stamps on arrival,
+// so this barely varies. A virtual camera stamps a perfect cadence and delivers in
+// clumps, so it can vary by 15 ms.
+double AsyncSender::delay_ms(const PreparedField& field) {
+    return std::chrono::duration<double, std::milli>(field.captured - field.source).count();
 }
 
-void AsyncSender::note_handoff(const PreparedField& field) {
-    delivery_offset_ = field.captured - field.source;
-    delivery_valid_ = true;
+// How much earlier than the source's usual worst delay this picture arrived, or 0
+// for a picture from a previous capture graph. Caller holds mutex_.
+double AsyncSender::early_ms(const PreparedField& field) const {
+    return field.handoff_epoch == handoff_epoch_ ? timing_.early_ms(delay_ms(field)) : 0.0;
 }
 
 // Caller holds mutex_ and has filled pending_.
@@ -178,6 +181,10 @@ void AsyncSender::publish_pending(PendingKind kind, unsigned width, unsigned hei
     pending_started_ = started;
     pending_hold_ = hold;
     pending_epoch_ = handoff_epoch_;
+    // Every picture counts, from its handover, so the allowance is known before the
+    // stream starts. A desktop picture is released on its own tick, so its delay
+    // says nothing.
+    if (!hold) timing_.note_arrival(std::chrono::duration<double, std::milli>(pending_at_ - source).count());
     pending_w_ = width;
     pending_h_ = height;
     pending_kind_ = kind;
@@ -417,10 +424,8 @@ void AsyncSender::restart_rate_lock() {
 void AsyncSender::reset_handoff() {
     std::lock_guard lock(mutex_);
     ++handoff_epoch_;
-    delivery_valid_ = false;
-    held_late_ = false;
     held_ready_ = false;
-    delivery_offset_ = {};
+    timing_.reset();
     media_origin_valid_ = false;
     pending_ready_ = false;
     pending_hold_ = false;
@@ -461,8 +466,8 @@ bool AsyncSender::free_run_can_lock(clock::time_point now, FreeWatch& watch) {
     if (!measured || previous <= 0.0 || std::abs(fps / previous - 1.0) > kFreeAgreement) return false;
     const VideoMode mode = sender_.mode();
     const VideoMode other = video_mode_for(!is_pal_mode(mode), !is_interlaced(mode));
-    return plan_rate(fps, Sender::nominal_mode_rate(mode) * start_clock_error()).trim > 0.0 ||
-           plan_rate(fps, Sender::nominal_mode_rate(other) * start_clock_error()).trim > 0.0;
+    return plan_rate(fps, Sender::nominal_mode_rate(mode)).trim > 0.0 ||
+           plan_rate(fps, Sender::nominal_mode_rate(other)).trim > 0.0;
 }
 
 void AsyncSender::start_workers() {
@@ -705,14 +710,16 @@ void AsyncSender::sender_loop() {
 
     bool have_frame = false;
     LatencyProbe probe;
+    // The frame the last new picture went to, so the next one doesn't share it.
+    bool last_fresh_valid = false;
+    uint32_t last_fresh_frame = 0;
     FreeWatch free_watch;
     capture_unusual_.store(false);
     duplicates_.store(0);
     const bool can_lock = rate_lock_.load();
     RateLock rate;
-    rate.use_trim = can_lock && sender_.has_trim();
     rate.trim_ppm = trim_ppm_;
-    if (rate.use_trim && trim_ppm_ != 0.0) sender_.set_trim(trim_ppm_); // INIT cleared it
+    if (can_lock && trim_ppm_ != 0.0) sender_.set_trim(trim_ppm_); // INIT cleared it
     if (!can_lock) {
         rate.go_free("turned off");
     } else if (start_plan_.trim > 0.0) {
@@ -725,18 +732,10 @@ void AsyncSender::sender_loop() {
     }
     const auto publish_rate_log = [&] { add_log(std::exchange(rate.log, std::string())); };
     publish_rate_log();
-    // A clock change failing means the session is gone: the send path reports it.
-    const auto retune = [&] {
-        if (!sender_.retune(rate.scale)) {
-            report_sender_error();
-            errors_.fetch_add(1);
-        }
-    };
 
     for (;;) {
         bool fresh = false;
         bool at_deadline = false;
-        bool at_land = false;
         bool track_phase = true;
         bool repeat_planned = false;
         bool send_black = false;
@@ -751,58 +750,22 @@ void AsyncSender::sender_loop() {
             } else {
                 const bool wait_for_sample = rate.capture_clocked();
                 repeat_planned = wait_for_sample && rate.repeat_planned();
-                // Any new sample wakes the wait. A late one does not go out then:
-                // it waits for the next refresh.
-                const auto sample_ready = [&] {
-                    return !running_ || (wait_for_sample && prep_new_ && !held_late_);
-                };
+                const auto sample_ready = [&] { return !running_ || (wait_for_sample && prep_new_); };
                 const auto deadline = sender_.next_frame_deadline(!wait_for_sample || repeat_planned);
-                const auto this_source = [&] {
-                    return prepared_[prep_ready_].handoff_epoch == handoff_epoch_;
-                };
-                const bool holding = wait_for_sample &&
-                                     (held_late_ || (prep_new_ && this_source() &&
-                                                     late_handoff(prepared_[prep_ready_])));
-                auto until = deadline;
-                if (holding) {
-                    const auto land = sender_.next_land(RateLock::kTrimLandMarginSeconds);
-                    if (land <= deadline) until = land;
-                }
-                const bool wait_for_land = holding && until != deadline;
-                if (!prepared_cv_.wait_until(lock, until - kSpinBeforeDeadline, sample_ready)) {
-                    while (!sample_ready() && clock::now() < until) {
+                if (!prepared_cv_.wait_until(lock, deadline - kSpinBeforeDeadline, sample_ready)) {
+                    while (!sample_ready() && clock::now() < deadline) {
                         lock.unlock();
                         std::this_thread::yield();
                         lock.lock();
                     }
-                    if (!sample_ready()) {
-                        at_land = wait_for_land;
-                        at_deadline = !wait_for_land;
-                    }
+                    at_deadline = !sample_ready();
                 }
             }
             if (!running_) break;
-            const auto this_source = [&] {
-                return prepared_[prep_ready_].handoff_epoch == handoff_epoch_;
-            };
-            if (prep_new_ && held_late_ && at_land && this_source()) {
-                const bool late = late_handoff(prepared_[prep_ready_]);
-                if (!late) note_handoff(prepared_[prep_ready_]);
-                track_phase = !late;
-                held_late_ = false;
-                std::swap(prep_ready_, prep_front_);
-                prep_new_ = false;
-                fresh = true;
-                have_frame = true;
-            } else if (prep_new_ && have_frame && this_source() &&
-                       late_handoff(prepared_[prep_ready_])) {
-                held_late_ = true;
-            } else if (prep_new_) {
+            if (prep_new_) {
                 // A frame from the previous graph can still be sent. It must not
-                // become the new source's idea of on time.
-                if (this_source()) note_handoff(prepared_[prep_ready_]);
-                else track_phase = false;
-                held_late_ = false;
+                // become the new source's idea of where pictures land.
+                if (prepared_[prep_ready_].handoff_epoch != handoff_epoch_) track_phase = false;
                 std::swap(prep_ready_, prep_front_);
                 prep_new_ = false;
                 fresh = true;
@@ -824,9 +787,48 @@ void AsyncSender::sender_loop() {
         const double pickup_ms =
             std::chrono::duration<double, std::milli>(field.picked - field.captured).count();
         if (fresh && rate.take_release()) {
+            // The first picture sets where pictures land. Place it as if it had
+            // arrived at the source's usual worst delay, so a source that delivers
+            // in clumps starts where it will stay.
+            double early = 0.0;
+            {
+                std::lock_guard lock(mutex_);
+                early = std::max(0.0, early_ms(field));
+            }
             const auto until = clock::now() + std::chrono::duration_cast<clock::duration>(
-                                                  std::chrono::duration<double>(RateLock::kLandMarginSeconds));
+                                                  std::chrono::duration<double>(
+                                                      RateLock::kLandMarginSeconds + early / 1000.0));
             while (clock::now() < until) std::this_thread::yield();
+        }
+        // A source that delivers in clumps hands over two pictures at once. Numbered
+        // by arrival, the second would take the refresh the first already has, and
+        // the next refresh would have nothing. So locked, a picture whose refresh is
+        // already taken waits for the next one, but only if the source's timing says
+        // it belongs there, and never longer than it came early: past that, waiting
+        // only adds delay, as while the raster is still catching up with a change in
+        // the source's timing. A capture card stamps on arrival, so it never waits.
+        clock::duration paced_wait{};
+        if (fresh && rate.capture_clocked() && last_fresh_valid) {
+            double early = 0.0;
+            {
+                std::lock_guard lock(mutex_);
+                early = early_ms(field);
+            }
+            const auto started = clock::now();
+            const uint32_t now_number = sender_.frame_number_at(started);
+            if (early > 0.0 && now_number <= last_fresh_frame) {
+                const auto would_arrive = started + std::chrono::duration_cast<clock::duration>(
+                                                        std::chrono::duration<double, std::milli>(early));
+                const uint32_t next = last_fresh_frame + 1u;
+                if (sender_.frame_number_at(would_arrive) >= next) {
+                    const auto until = sender_.earliest_send_for(next);
+                    if (until > started && until <= would_arrive) {
+                        if (until - started > kSpinBeforeDeadline) std::this_thread::sleep_until(until - kSpinBeforeDeadline);
+                        while (clock::now() < until) std::this_thread::yield();
+                        paced_wait = clock::now() - started;
+                    }
+                }
+            }
         }
         double elapsed_ms = 0.0;
         const bool sent = sender_.send_prepared(field, elapsed_ms);
@@ -834,6 +836,11 @@ void AsyncSender::sender_loop() {
         if (!sent) {
             stop_on_send_error();
             break;
+        }
+        if (fresh) {
+            // A session restart numbers frames from 0 again.
+            last_fresh_valid = rate.capture_clocked() && sender_.frame() >= last_fresh_frame;
+            last_fresh_frame = sender_.frame();
         }
         next_parity_.store(sender_.last_parity() ^ 1u);
         send_microseconds_.fetch_add(static_cast<uint64_t>(elapsed_ms * 1000.0 + 0.5));
@@ -856,15 +863,23 @@ void AsyncSender::sender_loop() {
             continue;
         }
         if (!fresh) continue;
+        // Place the raster for the source's usual worst delay rather than this
+        // picture's own arrival, which on a clumpy source jumps by many ms. On a
+        // steady source the two are the same.
+        clock::duration shift{};
+        {
+            std::lock_guard lock(mutex_);
+            shift = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double, std::milli>(early_ms(field)));
+        }
+        // A picture held for its refresh was sent later than it arrived.
+        shift -= paced_wait;
         const RateLock::Action action =
-            rate.after_send(sender_, field.captured, field.source, track_phase);
+            rate.after_send(sender_, field.source, track_phase, shift);
         publish_rate_log();
         if (action == RateLock::Action::Restart) {
-            // Free-run on the current clock until the main thread calibrates again.
-            const double scale = rate.scale;
+            // Free-run on the current clock until the main thread times capture again.
             const double trim = rate.trim_ppm;
             rate = RateLock{};
-            rate.scale = scale;
             rate.trim_ppm = trim;
             if (relock_allowed()) {
                 restart_rate_lock();
@@ -878,8 +893,6 @@ void AsyncSender::sender_loop() {
                 stop_on_send_error();
                 break;
             }
-        } else if (action == RateLock::Action::Retune) {
-            retune();
         }
     }
 }

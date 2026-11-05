@@ -2,14 +2,14 @@
 
 <img src="assets/GroovyGrab.png" alt="GroovyGrab logo" width="128">
 
-Stream an HDMI capture card to a CRT through a MiSTer, with about 5 to 6 ms from capture to scanout (measured on a Cam Link 4K).
+Stream an HDMI capture card, or a Windows desktop, to a CRT through a MiSTer, with about 5 to 6 ms from capture to scanout (measured on a Cam Link 4K).
 
 <p>
   <img src="assets/screenshot.png" alt="The GroovyGrab app streaming a PS Vita" width="62%">
   <img src="assets/crt.jpg" alt="The same picture on a Sony PVM CRT" width="35.5%">
 </p>
 
-**Experimental.** Provided as is, with no guarantees, so use it at your own risk. It sends custom video timings to your CRT and runs a modified core on your MiSTer. It's made for the included GroovyGrab core. In theory it also works on stock Groovy, but there are no guarantees.
+**Experimental.** Provided as is, with no guarantees, so use it at your own risk. It sends custom video timings to your CRT and runs a modified core on your MiSTer. It needs the included GroovyGrab core, and doesn't work with stock Groovy.
 
 ## Why
 
@@ -22,8 +22,8 @@ That makes it a good fit for slower-paced games and anything that doesn't need f
 ## What you need
 
 - Windows 10 or later, x64
-- A UVC HDMI capture card
-- A MiSTer on a wired gigabit network
+- A UVC HDMI capture card, or a monitor to stream from
+- A MiSTer on a wired gigabit network, running the included GroovyGrab core (stock Groovy doesn't work)
 - A 15 kHz CRT
 
 ## Setup
@@ -41,7 +41,13 @@ main=MiSTer_GroovyGrab
 3. Start GroovyGrab from the MiSTer's Utility menu.
 4. Run `GroovyGrab.exe` from the zip's `PC` folder, pick your capture device and mode, enter the MiSTer's address and press **Start Stream**.
 
-The picture appears after a few seconds of black. On stock Groovy you get 10 seconds of a Calibrating image first.
+The picture appears after a few seconds of black.
+
+## Other sources
+
+**Desktop.** Pick a monitor from the device list to stream what's on it. The stream runs at 50 or 60 fps whatever the monitor's own refresh rate. Monitors with HDR turned on aren't listed, so turn HDR off on the one you want to stream.
+
+**Virtual cameras**, such as OBS Virtual Camera, work like a capture card. They deliver frames less evenly, so expect a few more milliseconds of latency and an occasional repeated frame.
 
 ## Settings
 
@@ -49,11 +55,11 @@ Settings are saved to `GroovyGrab.ini` next to the app.
 
 | Setting | Default | What it does |
 |---|---|---|
-| **Device** | First capture card found | Capture card |
+| **Device** | First capture card found | Capture card, virtual camera, or a monitor (listed as Desktop) |
 | **Audio** | The capture card's audio | Audio sent with the stream |
 | **Colour Format** | Device default | Capture format |
 | **Resolution** | Device default | Capture size. Pick what your source outputs, so the card doesn't scale |
-| **Frame Rate** | Device default | Capture rate. Rates near 50 fps switch to PAL modes |
+| **Frame Rate** | Device default | Capture rate. Rates near 50 fps switch to PAL modes. A monitor offers 50 or 60 |
 | **Address** | Empty | MiSTer IP address |
 | **CRT Output** | 480i | 480i or 240p (576i or 288p for PAL rates) |
 | **16:9 Letterbox** | Off | Fits 16:9 content inside the 4:3 picture |
@@ -68,7 +74,7 @@ Command line options: a device name, `--240p`, `--480i`, `--send` (start streami
 
 A capture card and a MiSTer run on separate clocks. Normally that means each frame waits for up to a full field, and a frame gets dropped whenever the clocks drift apart. GroovyGrab matches the MiSTer's pixel clock to the capture card instead, so each frame goes out as soon as it arrives and lands just ahead of scanout.
 
-The GroovyGrab core makes tiny adjustments to its pixel rate during blanking, so you don't see any correction. Stock Groovy can only change its clock with a small reset, which can nudge the picture, so the app does that as rarely as it can.
+The GroovyGrab core makes tiny adjustments to its pixel rate during blanking, so you don't see any correction. Stock Groovy can only change its clock with a small reset that nudges the picture, which is why the app needs its own core.
 
 Rates that are a clean multiple of the mode's, like 30 fps, lock too. Anything else runs at the standard clock.
 

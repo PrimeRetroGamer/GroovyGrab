@@ -39,9 +39,8 @@ double RateLock::wrap(double x) {
 
 void RateLock::start_parked(const RatePlan& rate_plan, double capture_fps) {
     plan = rate_plan;
-    scale = locked_scale = plan.trim;
     ref_fps = capture_fps / plan.skip;
-    state = use_trim ? State::Locked : State::Slide;
+    state = State::Locked;
     trim_sum = trim_sent = trim_ppm;
     trim_since = clock::now();
     release_pending = true;
@@ -74,108 +73,14 @@ double RateLock::median_gap_ms() const {
     return *mid;
 }
 
-void RateLock::reset_windows(clock::time_point now) {
-    since = now;
-    cap_rate.valid = ras_valid = have_target = false;
-    target_n = 0;
-    target_x = target_y = drift = 0.0;
-    step_ready = false;
-}
-
-bool RateLock::rates(const Sender& sender, double& capture_fps, double& raster_fps) {
-    if (!cap_rate.valid || !ras_valid) return false;
-    const double cap_s = seconds(cap_t1 - cap_rate.t0);
-    const double ras_s = seconds(ras_t1 - ras_t0);
-    if (cap_s < 4.0 || ras_s < 4.0) return false;
-    if (!cap_rate.fit.slope(capture_fps) || !ras_fit.slope(raster_fps)) {
-        return false;
-    }
-    const double nominal = sender.nominal_rate();
-    if (nominal > 0.0) {
-        // A noisy window (ACKs read late) is worse than the crystal:
-        // fall back to nominal. A clean one also captures this
-        // MiSTer's own crystal error, within the tolerance.
-        if (ras_fit.rms * sender.field_ms() > kNoisyFitMs) {
-            raster_fps = nominal;
-        } else {
-            raster_fps = std::clamp(raster_fps, nominal * (1.0 - kClockTolerance),
-                                    nominal * (1.0 + kClockTolerance));
-        }
-    }
-    return capture_fps > 0.0 && raster_fps > 0.0;
-}
-
-// Corrects the residual rate error found while locked, then slides the phase back.
-RateLock::Action RateLock::correct_rate(const Sender& sender, double capture_fps,
-                                        double raster_fps, const char* why) {
-    const double next = scale * capture_fps * plan.repeat / raster_fps;
-    // Needing more than this means the capture rate itself changed.
-    if (std::abs(next / scale - 1.0) > kMaxRefine) {
-        note("Rate lock restart: %s needs a %.0f ppm correction\n", why,
-             (next / scale - 1.0) * 1e6);
-        return Action::Restart;
-    }
-    ref_fps = capture_fps;
-    block_rate.valid = false;
-    const double clock_mhz = sender.pixel_clock_mhz() / scale * next;
-    const double field = sender.field_ms();
-    const bool nominal = ras_fit.rms * field > kNoisyFitMs;
-    note("Rate lock %d (%s): capture %.4f fps, MiSTer %.4f fps%s -> "
-         "pixel clock %.6f MHz (x%.6f) [raster fit %zu samples, "
-         "rms %.2f ms, worst %.2f ms, dropped %zu]\n",
-         ++locks, why, capture_fps, raster_fps,
-         nominal ? " (nominal: fit too noisy)" : "", clock_mhz, next,
-         ras_fit.samples.size(), ras_fit.rms * field,
-         ras_fit.worst * field, ras_fit.dropped);
-    locked_scale = next;
-    state = State::Slide;
-    slide_samples = 0;
-    // The drift already says which way to go, which saves a clock change.
-    slide_direction = drift < 0.0 ? 1 : -1;
-    scale = locked_scale * (1.0 + slide_direction * kSlideOffset);
-    return Action::Retune;
-}
-
-// Moves the raster until samples land just ahead of the blanking they must beat.
-RateLock::Action RateLock::update_slide(const Sender& sender) {
-    double position = 0.0;
-    clock::time_point at{};
-    if (!sender.raster_sample(position, at) || at == ras_last) return Action::None;
-    ras_last = at;
-    // The last ACK can be for a duplicate, sent on the raster's schedule rather than
-    // the sample's: carry it forward to this send.
-    position += seconds(clock::now() - at) * 1000.0 / sender.field_ms();
-
-    const double want = sender.release_fraction() - kLandMarginSeconds * 1000.0 / sender.field_ms();
-    const double error = wrap(position - std::floor(position) - want);
-    slide_error = slide_samples == 0 ? error : slide_error + 0.25 * wrap(error - slide_error);
-    ++slide_samples;
-    if (slide_samples < kSlideSettle) return Action::None;
-
-    if (slide_direction == 0) {
-        if (std::abs(slide_error) > kSlideStart) {
-            // A faster raster is further along when a sample arrives.
-            slide_direction = slide_error < 0.0 ? 1 : -1;
-            scale = locked_scale * (1.0 + slide_direction * kSlideOffset);
-            return Action::Retune;
-        }
-    } else if (slide_error * slide_direction < -kSlideDone) {
-        return Action::None;
-    } else {
-        scale = locked_scale;
-    }
-    const Action action = slide_direction == 0 ? Action::None : Action::Retune;
-    state = State::Locked;
-    reset_windows(clock::now());
-    return action;
-}
-
 RateLock::Action RateLock::update_trim(const Sender& sender) {
     double position = 0.0;
     clock::time_point at{};
     if (!sender.raster_sample(position, at)) return Action::None;
     const auto now = clock::now();
-    position += seconds(now - at) * 1000.0 / sender.field_ms();
+    // Where the raster is when this picture would have arrived at the source's usual
+    // worst delay, so a clumpy source doesn't swing the trim.
+    position += seconds(now + phase_shift - at) * 1000.0 / sender.field_ms();
     const double want = sender.release_fraction() - kTrimLandMarginSeconds * 1000.0 / sender.field_ms();
     if (trim_error_count < trim_errors.size()) {
         trim_errors[trim_error_count++] = wrap(position - std::floor(position) - want);
@@ -235,11 +140,10 @@ RateLock::Action RateLock::check_capture_rate(double gap_ms, clock::time_point c
     return Action::None;
 }
 
-RateLock::Action RateLock::after_send(const Sender& sender, clock::time_point arrived,
-                                       clock::time_point source, bool track_phase) {
-    if (state == State::Slide) return update_slide(sender);
+RateLock::Action RateLock::after_send(const Sender& sender, clock::time_point source, bool track_phase,
+                                       clock::duration shift) {
+    phase_shift = shift;
     if (state != State::Locked) return Action::None;
-    const auto now = clock::now();
     if (sender.field_ms() <= 0.0) return Action::None;
 
     double gap_ms = 0.0;
@@ -252,9 +156,9 @@ RateLock::Action RateLock::after_send(const Sender& sender, clock::time_point ar
     if (const Action change = check_capture_rate(gap_ms, source); change != Action::None) {
         return change;
     }
-    // The rate was recorded above. A frame sent on the next land does not move the phase.
+    // The rate was recorded above. A frame from a previous graph does not move the phase.
     if (!track_phase) return Action::None;
-    return use_trim ? update_trim(sender) : update_clock(sender, arrived, source, now);
+    return update_trim(sender);
 }
 
 void RateLock::record_gap(double gap_ms) {
@@ -262,89 +166,6 @@ void RateLock::record_gap(double gap_ms) {
     gaps[gap_next] = gap_ms;
     gap_next = (gap_next + 1) % gaps.size();
     gap_count = std::min(gap_count + 1, gaps.size());
-}
-
-// Stock core: holds the phase by correcting the clock when it has drifted too far.
-RateLock::Action RateLock::update_clock(const Sender& sender, clock::time_point arrived,
-                                           clock::time_point source, clock::time_point now) {
-    const bool warm = now - since >= kWarmup;
-    const double frame_ms = sender.field_ms(); // blit period
-    if (warm) {
-        if (!cap_rate.valid) {
-            const double seed_ms = gap_count >= 16 ? median_gap_ms() : frame_ms * plan.repeat;
-            cap_rate.start(source, 1000.0 / seed_ms);
-        } else {
-            cap_rate.add(source);
-        }
-        cap_t1 = source;
-    }
-    double position = 0.0;
-    clock::time_point at{};
-    const bool new_raster = sender.raster_sample(position, at) && at != ras_last;
-    if (new_raster && ras_valid && position < ras_p1) {
-        // Sender re-INITed: new frame epoch
-        // and a new raster phase. Start this state's timing again.
-        reset_windows(now);
-        return Action::None;
-    }
-    if (new_raster) {
-        ras_last = at;
-        if (warm) {
-            if (!ras_valid) {
-                ras_p0 = position;
-                ras_t0 = at;
-                ras_valid = true;
-                ras_fit.clear();
-            }
-            ras_p1 = position;
-            ras_t1 = at;
-            ras_fit.add(seconds(at - ras_t0), position - ras_p0);
-        }
-    }
-
-    // Phase of the raster when this sample arrived.
-    if (!warm || !new_raster) return Action::None;
-    const double ack_after_ms = std::chrono::duration<double, std::milli>(at - arrived).count();
-    const double phase = wrap(position - ack_after_ms / frame_ms);
-    if (!have_target) {
-        constexpr double kTau = 6.283185307179586;
-        target_x += std::cos(phase * kTau);
-        target_y += std::sin(phase * kTau);
-        if (++target_n >= 60) {
-            target = std::atan2(target_y, target_x) / kTau;
-            have_target = true;
-        }
-        return Action::None;
-    }
-    // Positive drift = fields arrive later in the raster frame. That
-    // eats the ~1 ms between normal arrival and the repeat deadline,
-    // so it re-locks much sooner than drift the other way, which
-    // only adds latency.
-    drift = 0.95 * drift + 0.05 * wrap(phase - target);
-    if (now - step_at >= kStepCheck) {
-        const double moved = drift - step_drift;
-        const bool stepped = step_ready && std::abs(moved) > kStepFrames;
-        step_drift = drift;
-        step_at = now;
-        step_ready = true;
-        if (stepped) {
-            note("Rate lock: capture timing stepped %.2f ms, sliding back\n", moved * frame_ms);
-            state = State::Slide;
-            slide_samples = 0;
-            slide_direction = 0;
-            return Action::None;
-        }
-    }
-    if (drift < kDriftLate && drift > -kDriftLimit) return Action::None;
-    const double held_s = seconds(now - since);
-    if (held_s < kMinLockedSeconds) return Action::None;
-    double capture_fps = 0.0, raster_fps = 0.0;
-    if (rates(sender, capture_fps, raster_fps)) {
-        char why[64];
-        std::snprintf(why, sizeof(why), "drift %+.3f frame after %.0f s", drift, held_s);
-        return correct_rate(sender, capture_fps, raster_fps, why);
-    }
-    return Action::None;
 }
 
 } // namespace groovy

@@ -21,6 +21,8 @@ add_executable(GroovyGrab WIN32
     src/format_menu.cpp
     src/preview_renderer.cpp
     src/directshow_capture.cpp
+    src/desktop_capture.cpp
+    src/source_timing.cpp
     src/audio_capture.cpp
     src/async_sender.cpp
     src/async_calibrate.cpp
@@ -52,6 +54,10 @@ add_executable(field_prep_test tests/field_prep_test.cpp src/field_prep.cpp src/
 target_compile_features(field_prep_test PRIVATE cxx_std_20)
 target_compile_definitions(field_prep_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(field_prep_test PRIVATE src "${LZ4_DIR}")
+# Sources that deliver in awkward ways, against the timing model. Takes a second.
+add_executable(source_timing_test tests/source_timing_test.cpp src/source_timing.cpp)
+target_compile_features(source_timing_test PRIVATE cxx_std_20)
+target_include_directories(source_timing_test PRIVATE src)
 
 add_custom_command(TARGET GroovyGrab POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

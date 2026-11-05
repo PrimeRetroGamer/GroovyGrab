@@ -5,6 +5,7 @@
 #include "jpeg_decode.h"
 #include "latency_probe.h"
 #include "rate_lock.h"
+#include "source_timing.h"
 
 #include <array>
 #include <atomic>
@@ -97,8 +98,14 @@ public:
     // fits the measured capture rate. Valid while connected.
     VideoMode mode() const { return sender_.mode(); }
     bool opening() const { return opening_.load(); }
-    // Showing the Calibrating image while timing capture and the MiSTer.
+    // Showing black while capture is timed, before the picture starts.
     bool calibrating() const { return calibrating_.load(); }
+
+    // The MiSTer runs a core other than GroovyGrab's. Retrying would only restart
+    // that core's picture every time, so the app waits until the user changes
+    // something. clear_wrong_core() allows the next attempt.
+    bool wrong_core() const { return wrong_core_.load(); }
+    void clear_wrong_core() { wrong_core_.store(false); }
     // Why the stream failed; empty if it did not.
     std::string error() const;
 
@@ -110,8 +117,8 @@ public:
     // The capture graph was replaced. The next source learns its own stamp-to-arrival
     // gap; a frame already in flight from the old graph does not set it.
     void reset_handoff();
-    // The source changed during a stream: call start_recalibrate() to show the
-    // Calibrating image and time it again.
+    // The source changed during a stream: call start_recalibrate() to time it again,
+    // behind a few seconds of black.
     bool recalibrate_needed() const { return rate_lock_.load() && recalibrate_.load(); }
     void start_recalibrate();
 
@@ -129,14 +136,11 @@ private:
 
     bool open(const std::string& ip, VideoMode mode, uint32_t audio_rate_hz);
     VideoMode plan_start(VideoMode mode);
-    double start_clock_error() const;
     bool relock_allowed();
     bool free_run_can_lock(std::chrono::steady_clock::time_point now, FreeWatch& watch);
-    bool prepare_calibration_fields(VideoMode mode, PreparedField& image, PreparedField& black);
     bool prepare_black(VideoMode mode, PreparedField& black);
     bool send_at_deadline(const PreparedField& field);
     bool wait_for_capture(VideoMode mode);
-    bool calibrate(VideoMode mode);
     bool calibrate_and_start(VideoMode mode);
     void stop_session();
     void start_workers();
@@ -152,8 +156,8 @@ private:
     void note_desktop_scale(std::chrono::nanoseconds cost);
     void finish_held_scale(bool keep, const PreparedField& field, uint64_t epoch);
     std::chrono::steady_clock::time_point media_time(std::int64_t sample_100ns);
-    bool late_handoff(const PreparedField& field) const;
-    void note_handoff(const PreparedField& field);
+    double early_ms(const PreparedField& field) const;
+    static double delay_ms(const PreparedField& field);
     void publish_preview(const uint8_t* rgb, unsigned width, unsigned height);
     bool decode_mjpeg(const std::vector<uint8_t>& jpeg, unsigned width, unsigned height,
                       std::vector<uint8_t>& rgb, double& decode_ms);
@@ -171,6 +175,7 @@ private:
     std::thread open_thread_;
     std::atomic<bool> opening_{false};
     std::atomic<bool> calibrating_{false};
+    std::atomic<bool> wrong_core_{false};
     std::atomic<bool> cancel_open_{false};
     std::atomic<bool> connected_{false};
 
@@ -238,15 +243,13 @@ private:
     // the delay is learned again.
     uint64_t handoff_epoch_ = 0;
     uint64_t pending_epoch_ = 0;
-    bool delivery_valid_ = false;
-    bool held_late_ = false;
-    std::chrono::steady_clock::duration delivery_offset_{};
+    SourceTiming timing_; // when this source's pictures belong
+
     bool media_origin_valid_ = false;
     std::int64_t media_origin_ = 0;
     std::chrono::steady_clock::time_point media_steady_{};
     RatePlan start_plan_;
     double start_fps_ = 0.0;
-    double mister_clock_ = 1.0; // this MiSTer's actual rate relative to the one asked for
     double trim_ppm_ = 0.0;     // kept across mode changes, which clear it in the core
     std::mutex probe_mutex_;
     std::string probe_line_;

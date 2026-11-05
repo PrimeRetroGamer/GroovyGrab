@@ -77,10 +77,18 @@ void paint_cursor(uint8_t* image, int width, int height, const std::vector<uint8
                 uint8_t* dest = at(left + static_cast<int>(col), top + static_cast<int>(row));
                 if (!dest) continue;
                 const uint8_t* pixel = src + static_cast<size_t>(col) * 4u;
-                if (info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR && pixel[3] == 0) {
-                    dest[0] ^= pixel[0];
-                    dest[1] ^= pixel[1];
-                    dest[2] ^= pixel[2];
+                if (info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+                    // The alpha byte is a mask: 0 replaces the screen pixel, 0xFF inverts it.
+                    if (pixel[3]) {
+                        dest[0] ^= pixel[0];
+                        dest[1] ^= pixel[1];
+                        dest[2] ^= pixel[2];
+                    } else {
+                        dest[0] = pixel[0];
+                        dest[1] = pixel[1];
+                        dest[2] = pixel[2];
+                    }
+                    dest[3] = 255;
                 } else {
                     blend_pixel(dest, pixel[0], pixel[1], pixel[2], pixel[3]);
                 }
@@ -248,6 +256,9 @@ struct DesktopCapture::Runner {
     LONGLONG timestamp = -1;
     bool have = false;
     std::atomic<bool> stopping{false};
+    // The monitor is being read. A still desktop sends no new pictures, so this,
+    // not their arrival, says whether there is video.
+    std::atomic<bool> live{false};
     std::atomic<uint64_t> samples{0};
     std::atomic<uint64_t> replaced{0};
     std::mutex image_mutex;
@@ -385,6 +396,10 @@ uint64_t DesktopCapture::take_gaps() {
     return 0;
 }
 
+bool DesktopCapture::live() const {
+    return runner_ && runner_->live.load();
+}
+
 void DesktopCapture::show_preview(const std::vector<uint8_t>& shown, unsigned width, unsigned height) {
     if (shown.size() < static_cast<size_t>(width) * height * 4u) return;
     std::lock_guard lock(runner_->mutex);
@@ -442,6 +457,23 @@ void DesktopCapture::run(std::promise<std::string>& opened) {
             if (FAILED(output1->DuplicateOutput(device.Get(), &duplication))) {
                 throw std::runtime_error("Couldn't duplicate that monitor");
             }
+            // Windows takes the duplication away when the display changes: a new
+            // mode, a fullscreen game, a security prompt. Ask for it again until it
+            // comes back, and keep sending the last picture meanwhile.
+            const auto reopen = [&] {
+                runner_->live.store(false);
+                duplication.Reset();
+                std::printf("Desktop capture lost: waiting for the monitor\n");
+                while (!runner_->stopping.load()) {
+                    if (WaitForSingleObject(runner_->stop, 100) == WAIT_OBJECT_0) return false;
+                    if (SUCCEEDED(output1->DuplicateOutput(device.Get(), &duplication))) {
+                        std::printf("Desktop capture back\n");
+                        runner_->live.store(true);
+                        return true;
+                    }
+                }
+                return false;
+            };
             DXGI_OUTDUPL_DESC dup_desc{};
             duplication->GetDesc(&dup_desc);
             if (dup_desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
@@ -451,6 +483,7 @@ void DesktopCapture::run(std::promise<std::string>& opened) {
             format_.height = static_cast<int>(dup_desc.ModeDesc.Height);
             format_.pixel_format = directshow_capture::VideoFormat::PixelFormat::bgra;
             std::printf("Desktop format: BGRA %dx%d at %.2f fps\n", format_.width, format_.height, format_.fps);
+            runner_->live.store(true);
             grab_opened.set_value("");
 
             std::vector<uint8_t> desktop;
@@ -464,22 +497,20 @@ void DesktopCapture::run(std::promise<std::string>& opened) {
                 const HRESULT acquired = duplication->AcquireNextFrame(15, &frame, &resource);
                 if (runner_->stopping.load()) break;
                 if (acquired == DXGI_ERROR_WAIT_TIMEOUT) continue;
-                if (acquired == DXGI_ERROR_ACCESS_LOST) {
-                    std::printf("Desktop capture stopped: the monitor changed\n");
-                    break;
+                if (FAILED(acquired)) {
+                    if (!reopen()) break;
+                    continue;
                 }
-                if (SUCCEEDED(acquired)) {
-                    if (frame.AccumulatedFrames > 0 && resource) {
-                        ComPtr<ID3D11Texture2D> texture;
-                        if (SUCCEEDED(resource.As(&texture))) {
-                            copy_desktop(device.Get(), context.Get(), texture.Get(), staging, desktop, width, height);
-                        }
+                if (frame.AccumulatedFrames > 0 && resource) {
+                    ComPtr<ID3D11Texture2D> texture;
+                    if (SUCCEEDED(resource.As(&texture))) {
+                        copy_desktop(device.Get(), context.Get(), texture.Get(), staging, desktop, width, height);
                     }
-                    if (frame.LastMouseUpdateTime.QuadPart != 0 || frame.PointerShapeBufferSize != 0) {
-                        read_pointer(duplication.Get(), frame, pointer);
-                    }
-                    duplication->ReleaseFrame();
                 }
+                if (frame.LastMouseUpdateTime.QuadPart != 0 || frame.PointerShapeBufferSize != 0) {
+                    read_pointer(duplication.Get(), frame, pointer);
+                }
+                duplication->ReleaseFrame();
                 if (desktop.empty() || width < 2 || height < 1) continue;
                 shown = desktop;
                 if (pointer.visible) {
@@ -494,7 +525,9 @@ void DesktopCapture::run(std::promise<std::string>& opened) {
                 ++runner_->image_serial;
                 SetEvent(runner_->image_ready);
             }
+            runner_->live.store(false);
         } catch (const std::exception& error) {
+            runner_->live.store(false);
             try {
                 grab_opened.set_value(error.what());
             } catch (const std::future_error&) {

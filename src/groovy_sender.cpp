@@ -50,6 +50,9 @@ constexpr uint32_t kMailboxFail = 60;    // ~1 s of confirmed stall
 // black until something resets it, with no error flag. An empty video queue is
 // normal now and then, but not this many ACKs in a row.
 constexpr uint32_t kVideoStuck = 12;     // ~0.2 s
+// Fields can run one further ahead for several seconds after the source's timing
+// steps, while the trim moves the raster back.
+constexpr uint32_t kVideoStuckAhead = 180; // ~3 s
 // A lost packet can also leave the core replaying old frames with its frame skip flag
 // up, when its volatile framebuffer option is off. Nothing else looks wrong, and it
 // doesn't end by itself. Only INIT clears it.
@@ -140,6 +143,7 @@ bool Sender::open(const std::string& ip, VideoMode mode, uint32_t audio_rate_hz,
     endpoint_ = endpoint;
     session_open_ = false;
     has_trim_ = false;
+    wrong_core_ = false;
     audio_rate_hz_ = audio_rate_hz == 44100 || audio_rate_hz == 48000 ? audio_rate_hz : 0;
 
     if (!handshake(mode)) return false;
@@ -251,18 +255,23 @@ Sender::clock::time_point Sender::next_frame_deadline(bool early) const {
                      std::chrono::duration<double>(frames_left * frame_seconds()));
 }
 
-Sender::clock::time_point Sender::next_land(double margin_seconds) const {
-    const auto now = clock::now();
+uint32_t Sender::frame_number_at(clock::time_point t) const {
+    if (!raster_valid_ || raster_count_ == 0) return frame_ + 1u;
+    const double margin = std::chrono::duration<double>(kNumberMargin).count() / frame_seconds();
+    return static_cast<uint32_t>(std::floor(raster_at_time(t) + margin)) + 1u;
+}
+
+// The inverse of advance_frame(): a field is numbered floor(raster + margin) + 1, so
+// it becomes `frame` once the raster reaches frame - 1 - margin.
+Sender::clock::time_point Sender::earliest_send_for(uint32_t frame) const {
+    if (!raster_valid_ || raster_count_ == 0) return {};
     const double period = frame_seconds();
-    if (!raster_valid_ || period <= 0.0) return now + frame_duration();
-    const double want = release_fraction() - margin_seconds / period;
-    const double pos = raster_at_time(now);
-    double target = std::floor(pos) + want;
-    // Half a millisecond: closer than that and the spin would miss this land.
-    if (pos + 0.0005 / period >= target) target += 1.0;
-    const double frames_left = target - pos;
-    return now + std::chrono::duration_cast<clock::duration>(
-                     std::chrono::duration<double>(frames_left * period));
+    if (period <= 0.0) return {};
+    const double margin = std::chrono::duration<double>(kNumberMargin).count() / period;
+    const double best = *std::max_element(raster_offsets_.begin(),
+                                          raster_offsets_.begin() + static_cast<ptrdiff_t>(raster_count_));
+    const double frames = static_cast<double>(frame) - 1.0 - margin - best;
+    return raster_epoch_ + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(frames * period));
 }
 
 bool Sender::raster_sample(double& position, clock::time_point& at) const {
@@ -335,8 +344,17 @@ bool Sender::transmit_field(const char* data, int compressed_size, uint8_t udp_f
     timing_.stream_ms = ms_between(stream_started, last_blit_at_);
     timing_.sent_at = last_blit_at_;
     wait_ack(std::chrono::milliseconds(4));
-    empty_queue_streak_ = ack_.vram_queued ? 0 : empty_queue_streak_ + 1;
-    if (empty_queue_streak_ == kVideoStuck) {
+    // The core ACKs a field as its command arrives, and normally that field is two
+    // frames after the one scanning. One further ahead is already in the core,
+    // waiting: its queue reads empty until the field before it has scanned. Only an
+    // empty queue with nothing waiting means the core is stuck. Should a packet be
+    // lost while fields are that far ahead, the longer limit still catches it.
+    const bool waiting_ahead = ack_.echo > ack_.gpu_frame + 2u;
+    empty_queue_streak_ = (ack_.vram_queued || waiting_ahead) ? 0 : empty_queue_streak_ + 1;
+    empty_queue_any_ = ack_.vram_queued ? 0 : empty_queue_any_ + 1;
+    // Each fires once per stretch, and the longer one only if the shorter didn't.
+    if (empty_queue_streak_ == kVideoStuck ||
+        (empty_queue_any_ == kVideoStuckAhead && empty_queue_streak_ < kVideoStuck)) {
         char line[64];
         std::snprintf(line, sizeof(line), "MiSTer video stuck (frame %u), resetting it\n", frame_);
         log_ += line;
@@ -392,11 +410,23 @@ bool Sender::handshake(VideoMode mode) {
         return give_up("No reply to INIT within 1 s", "No reply from MiSTer. Is the GroovyGrab core running?");
     }
     session_open_ = true;
+    // Asked a few times: one lost reply must not make GroovyGrab's own core look like
+    // another. Stock Groovy answers with another number, or not at all if it's older.
     const uint8_t get_version = kCmdGetVersion;
-    if (send_packet(&get_version, 1) && await_reply(reply, kVersionLength, std::chrono::milliseconds(200))) {
-        has_trim_ = reply[0] == kTrimVersion;
+    for (int attempt = 0; attempt < 3 && !has_trim_; ++attempt) {
+        if (send_packet(&get_version, 1) && await_reply(reply, kVersionLength, std::chrono::milliseconds(200))) {
+            has_trim_ = reply[0] == kTrimVersion;
+            if (!has_trim_) break; // an answer, just not ours
+        }
     }
     set_recv_timeout(1);
+    // Stock Groovy answers too, but only the GroovyGrab core can trim its pixel rate,
+    // which the lock needs.
+    if (!has_trim_) {
+        wrong_core_ = true;
+        return give_up("Not the GroovyGrab core: no pixel rate trim",
+                       "This MiSTer runs another core, such as stock Groovy. Start GroovyGrab from its Utility menu.");
+    }
     // INIT reallocates the session, restarts the core's frame counter and clears its trim.
     ack_ = {};
     frame_ = 0;
@@ -477,6 +507,7 @@ bool Sender::mailbox_lost() {
 void Sender::reset_mailbox_watch() {
     frames_since_reset_ = 0;
     empty_queue_streak_ = 0;
+    empty_queue_any_ = 0;
     frame_skip_streak_ = 0;
     unsynced_streak_ = 0;
     no_ack_streak_ = 0;

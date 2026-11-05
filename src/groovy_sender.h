@@ -54,6 +54,9 @@ public:
     // The GroovyGrab core can trim the pixel rate with no reset or visible step, which
     // replaces retune() once a stream is running. Known after connecting.
     bool has_trim() const { return has_trim_; }
+
+    // The last open reached a core that isn't GroovyGrab's.
+    bool wrong_core() const { return wrong_core_; }
     // Runs the raster this many ppm fast (negative: slow). INIT clears it.
     bool set_trim(double ppm);
 
@@ -89,9 +92,16 @@ public:
     // leaves more margin, for a frame with no sample to wait for.
     clock::time_point next_frame_deadline(bool early) const;
 
-    // Next time the beam reaches the usual send point: release_fraction minus
-    // `margin_seconds`. A frame that missed this field's land goes out here.
-    clock::time_point next_land(double margin_seconds) const;
+    // The number a field sent at `t` would get: the next frame the raster can still
+    // scan out then. The next frame number when the raster position is not known.
+    uint32_t frame_number_at(clock::time_point t) const;
+
+    // The number of the field last sent.
+    uint32_t frame() const { return frame_; }
+
+    // Earliest time a field sent then is numbered `frame` or later. Default-constructed
+    // when the raster position is not known.
+    clock::time_point earliest_send_for(uint32_t frame) const;
 
     // Raster position (blit periods, fractional) at the most recent ACK for one
     // of our fields, and when that ACK arrived.
@@ -153,6 +163,7 @@ private:
     std::mutex socket_mutex_;   // interrupt() comes from another thread
     bool session_open_ = false; // Groovy ACKed our INIT: CLOSE is owed
     bool has_trim_ = false;
+    bool wrong_core_ = false;
     double trim_ppm_ = 0.0;     // what the core is trimmed by
     std::mutex wire_mutex_;     // video and audio threads share the socket
     std::string error_;
@@ -187,6 +198,7 @@ private:
     uint32_t unsynced_streak_ = 0;
     uint32_t no_ack_streak_ = 0;
     uint32_t empty_queue_streak_ = 0;
+    uint32_t empty_queue_any_ = 0;
     uint32_t frame_skip_streak_ = 0;
     clock::time_point last_decoder_restart_{};
 };

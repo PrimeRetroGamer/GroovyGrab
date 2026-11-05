@@ -47,6 +47,8 @@ public:
     uint64_t take_replaced_samples();
     uint64_t take_samples();
     uint64_t take_gaps();
+    // The monitor is being read, whether or not the picture is changing.
+    bool live() const;
 
     const std::wstring& device_name() const { return device_name_; }
     const directshow_capture::VideoFormat& format() const { return format_; }
